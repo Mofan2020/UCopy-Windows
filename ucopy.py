@@ -12,9 +12,6 @@ import win32con
 import win32file
 import win32gui
 import win32gui_struct
-import win32wnet
-import win32net
-from win32com.shell import shell, shellcon
 import pythoncom
 import pystray
 from PIL import Image, ImageDraw
@@ -40,7 +37,6 @@ def get_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-            # 补充可能缺少的键
             for k, v in DEFAULT_CONFIG.items():
                 if k not in cfg:
                     cfg[k] = v
@@ -60,12 +56,10 @@ def set_auto_start(enable):
         0, win32con.KEY_SET_VALUE
     )
     if enable:
-        exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
-        if not getattr(sys, 'frozen', False):
-            # 如果是脚本，需要运行 pythonw.exe 来避免控制台
-            exe_path = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+        if getattr(sys, 'frozen', False):
+            exe_path = sys.executable
         else:
-            exe_path = f'"{exe_path}"'
+            exe_path = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
         win32api.RegSetValueEx(key, "UCopy", 0, win32con.REG_SZ, exe_path)
     else:
         try:
@@ -75,28 +69,24 @@ def set_auto_start(enable):
     win32api.RegCloseKey(key)
 
 def get_drive_info(drive_letter):
-    """获取卷标和序列号（作为UUID）"""
     try:
         label, _, serial, _, _ = win32api.GetVolumeInformation(drive_letter + "\\")
         return label or "无卷标", f"{serial:08X}"
-    except Exception:
+    except:
         return "未知磁盘", "00000000"
 
 def get_free_space_mb(path):
-    """获取路径所在磁盘剩余空间（MB）"""
     if not os.path.exists(path):
-        return 0
-    # 如果路径不存在，向上找存在的父目录
-    p = path
-    while p and not os.path.exists(p):
-        p = os.path.dirname(p)
-    if not p:
-        return 0
-    free = win32file.GetDiskFreeSpaceEx(p)[0]
+        p = path
+        while p and not os.path.exists(p):
+            p = os.path.dirname(p)
+        if not p:
+            return 0
+        path = p
+    free = win32file.GetDiskFreeSpaceEx(path)[0]
     return free // (1024 * 1024)
 
 def get_total_files_and_size(root):
-    """遍历目录，返回总文件数和总大小(字节)"""
     total_files = 0
     total_size = 0
     for dirpath, _, filenames in os.walk(root):
@@ -111,15 +101,12 @@ def get_total_files_and_size(root):
     return total_files, total_size
 
 def should_copy_file(filename, extensions, pattern):
-    """判断文件是否符合扩展名和正则过滤条件"""
-    # 扩展名过滤（逗号分隔，不区分大小写）
     if extensions.strip():
         exts = [e.strip().lower() for e in extensions.split(",") if e.strip()]
         if exts:
             _, ext = os.path.splitext(filename)
             if ext.lower() not in exts:
                 return False
-    # 正则过滤
     if pattern.strip():
         try:
             if not re.search(pattern, filename):
@@ -129,10 +116,6 @@ def should_copy_file(filename, extensions, pattern):
     return True
 
 def copy_drive(drive_letter, config):
-    """
-    复制整个U盘到目标目录
-    返回 (success, message)
-    """
     target_base = config["target_folder"]
     if not target_base:
         return False, "未设置目标目录"
@@ -141,16 +124,13 @@ def copy_drive(drive_letter, config):
     dest_root = os.path.join(target_base, f"{label}_{serial}")
     src_root = drive_letter + "\\"
 
-    # 先检查目标剩余空间
     min_free = config.get("min_free_space_mb", 0)
     if min_free > 0:
-        # 如果目标目录还不存在，检查其父目录的剩余空间
         check_path = target_base if os.path.exists(target_base) else os.path.dirname(target_base)
         free_mb = get_free_space_mb(check_path)
         if free_mb < min_free:
             return False, f"目标磁盘空间不足（剩余 {free_mb} MB，要求 {min_free} MB）"
 
-    # 计算U盘总文件数和总大小
     total_files, total_size = get_total_files_and_size(src_root)
     max_files = config.get("max_total_files", 0)
     max_size_mb = config.get("max_total_size_mb", 0)
@@ -160,10 +140,8 @@ def copy_drive(drive_letter, config):
     if max_size_mb > 0 and total_size > max_size_mb * 1024 * 1024:
         return False, f"总大小超过限制（{total_size / (1024*1024):.1f} MB > {max_size_mb} MB）"
 
-    # 单个文件大小限制
-    max_single = config.get("max_single_file_mb", 0)
-    max_single_bytes = max_single * 1024 * 1024 if max_single > 0 else None
-
+    max_single_mb = config.get("max_single_file_mb", 0)
+    max_single_bytes = max_single_mb * 1024 * 1024 if max_single_mb > 0 else None
     ext_filter = config.get("extensions", "")
     regex_filter = config.get("regex_pattern", "")
 
@@ -171,16 +149,13 @@ def copy_drive(drive_letter, config):
     skipped_count = 0
 
     try:
-        for dirpath, dirnames, filenames in os.walk(src_root):
-            # 计算相对路径
+        for dirpath, _, filenames in os.walk(src_root):
             rel_dir = os.path.relpath(dirpath, src_root)
             dest_dir = os.path.join(dest_root, rel_dir) if rel_dir != "." else dest_root
             os.makedirs(dest_dir, exist_ok=True)
 
             for fn in filenames:
                 src_file = os.path.join(dirpath, fn)
-
-                # 检查单个文件大小
                 try:
                     file_size = os.path.getsize(src_file)
                 except OSError:
@@ -191,23 +166,20 @@ def copy_drive(drive_letter, config):
                     skipped_count += 1
                     continue
 
-                # 检查文件过滤
                 if not should_copy_file(fn, ext_filter, regex_filter):
                     skipped_count += 1
                     continue
 
-                # 执行复制
                 dest_file = os.path.join(dest_dir, fn)
                 try:
-                    win32file.CopyFile(src_file, dest_file, False)  # False = 不覆盖？ True=覆盖失败？ 我们要覆盖
-                except Exception as e:
-                    # 如果因为权限等问题失败，记录并跳过
+                    win32file.CopyFile(src_file, dest_file, False)
+                except:
                     skipped_count += 1
                     continue
-                # 保留原始时间戳（可选）
+                # 保留时间戳
                 try:
-                    src_stat = os.stat(src_file)
-                    os.utime(dest_file, (src_stat.st_atime, src_stat.st_mtime))
+                    st = os.stat(src_file)
+                    os.utime(dest_file, (st.st_atime, st.st_mtime))
                 except:
                     pass
                 copied_count += 1
@@ -218,28 +190,23 @@ def copy_drive(drive_letter, config):
 
 # ---------- 设备监控 ----------
 class DeviceMonitor:
-    """通过隐藏窗口接收WM_DEVICECHANGE消息来监测U盘插入"""
     def __init__(self, callback):
         self.callback = callback
-        self.hwnd = None
         self.thread = None
         self.stop_event = threading.Event()
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         if msg == win32con.WM_DEVICECHANGE:
             if wparam == win32con.DBT_DEVICEARRIVAL:
-                # 判断是否是逻辑卷
                 try:
-                    dev_broadcast = win32gui_struct.UnpackDEV_BROADCAST(lparam)
-                    if dev_broadcast.devicetype == win32con.DBT_DEVTYP_VOLUME:
-                        # 获取盘符
-                        drive_mask = dev_broadcast.unitmask
+                    dev = win32gui_struct.UnpackDEV_BROADCAST(lparam)
+                    if dev.devicetype == win32con.DBT_DEVTYP_VOLUME:
+                        mask = dev.unitmask
                         for i in range(26):
-                            if drive_mask & (1 << i):
-                                drive_letter = chr(ord('A') + i)
-                                # 确保是U盘（可移动磁盘）
-                                if win32file.GetDriveType(drive_letter + ":\\") == win32con.DRIVE_REMOVABLE:
-                                    self.callback(drive_letter + ":")
+                            if mask & (1 << i):
+                                drive = chr(ord('A') + i) + ":"
+                                if win32file.GetDriveType(drive + "\\") == win32con.DRIVE_REMOVABLE:
+                                    self.callback(drive)
                 except:
                     pass
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
@@ -248,24 +215,20 @@ class DeviceMonitor:
         pythoncom.CoInitialize()
         wc = win32gui.WNDCLASS()
         wc.lpfnWndProc = self._wnd_proc
-        wc.lpszClassName = "UCopyDeviceMonitor"
+        wc.lpszClassName = "UCopyMonitor"
         wc.hInstance = win32api.GetModuleHandle(None)
-        class_atom = win32gui.RegisterClass(wc)
-        self.hwnd = win32gui.CreateWindow(
-            class_atom, "", 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None
-        )
-        # 注册设备通知
+        atom = win32gui.RegisterClass(wc)
+        hwnd = win32gui.CreateWindow(atom, "", 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None)
         filter = win32gui_struct.PackDEV_BROADCAST_DEVICEINTERFACE(
             win32con.DBT_DEVTYP_DEVICEINTERFACE,
             win32con.GUID_DEVINTERFACE_USB_DEVICE
         )
-        win32gui.RegisterDeviceNotification(self.hwnd, filter, win32con.DEVICE_NOTIFY_WINDOW_HANDLE)
-        # 消息循环
+        win32gui.RegisterDeviceNotification(hwnd, filter, win32con.DEVICE_NOTIFY_WINDOW_HANDLE)
         while not self.stop_event.is_set():
             if win32gui.PumpWaitingMessages() != 0:
                 break
-        win32gui.DestroyWindow(self.hwnd)
-        win32gui.UnregisterClass(class_atom, wc.hInstance)
+        win32gui.DestroyWindow(hwnd)
+        win32gui.UnregisterClass(atom, wc.hInstance)
         pythoncom.CoUninitialize()
 
     def start(self):
@@ -274,27 +237,27 @@ class DeviceMonitor:
 
     def stop(self):
         self.stop_event.set()
-        if self.hwnd:
-            win32gui.PostMessage(self.hwnd, win32con.WM_QUIT, 0, 0)
         if self.thread:
-            self.thread.join(timeout=3)
+            self.thread.join(timeout=2)
 
-# ---------- 主控制器 ----------
+# ---------- 主应用 ----------
 class UCopyApp:
     def __init__(self):
         self.config = get_config()
         self.monitor = None
         self.tray_icon = None
         self.job_lock = threading.Lock()
-        self.current_jobs = {}  # drive_letter -> thread
+        self.current_jobs = {}
 
-        # 自动应用开机启动设置
+        # 主窗口（隐藏，用于 tkinter 事件循环）
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.title("UCopy")
+
+        # 初始应用开机自启设置
         set_auto_start(self.config.get("auto_start", False))
 
     def on_drive_inserted(self, drive_letter):
-        """U盘插入回调"""
-        print(f"检测到U盘: {drive_letter}")
-        # 避免重复处理
         with self.job_lock:
             if drive_letter in self.current_jobs and self.current_jobs[drive_letter].is_alive():
                 return
@@ -303,11 +266,9 @@ class UCopyApp:
             t.start()
 
     def copy_job(self, drive_letter):
-        """复制任务"""
-        time.sleep(1)  # 等待系统完全识别
+        time.sleep(1)
         success, msg = copy_drive(drive_letter, self.config)
         print(f"[{drive_letter}] {msg}")
-        # 可以在这里添加通知，例如托盘气泡
 
     def start_monitor(self):
         if self.monitor is None:
@@ -320,8 +281,6 @@ class UCopyApp:
             self.monitor = None
 
     def create_tray_icon(self):
-        """创建系统托盘图标"""
-        # 生成简单图标
         image = Image.new('RGB', (64, 64), color='white')
         dc = ImageDraw.Draw(image)
         dc.rectangle([16, 16, 48, 48], fill='blue')
@@ -329,95 +288,98 @@ class UCopyApp:
             pystray.MenuItem("打开设置", self.show_settings),
             pystray.MenuItem("退出", self.quit_app)
         )
-        self.tray_icon = pystray.Icon("UCopy", image, "UCopy - U盘自动复制", menu)
+        self.tray_icon = pystray.Icon("UCopy", image, "UCopy", menu)
 
     def show_settings(self, icon=None, item=None):
-        """显示设置窗口"""
-        # 恢复或创建设置窗口
-        SettingsWindow(self)
+        # 使用 Toplevel 创建设置窗口，避免阻塞主线程
+        SettingsWindow(self.root, self)
 
     def quit_app(self, icon=None, item=None):
         self.stop_monitor()
         if self.tray_icon:
             self.tray_icon.stop()
+        self.root.quit()
+        self.root.destroy()
         sys.exit(0)
 
     def run(self):
-        """启动应用（显示设置并进入后台）"""
         self.create_tray_icon()
         self.start_monitor()
-        # 启动时显示设置窗口，然后进入托盘
-        SettingsWindow(self)
-        self.tray_icon.run()
+        # 在另一个线程运行托盘，主线程运行 tkinter 循环
+        tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+        tray_thread.start()
+        # 首次启动时弹出设置窗口
+        self.root.after(500, self.show_settings)
+        self.root.mainloop()
 
-# ---------- 设置窗口 ----------
+# ---------- 设置窗口（Toplevel）----------
 class SettingsWindow:
-    def __init__(self, app):
+    def __init__(self, master, app):
         self.app = app
-        self.root = tk.Tk()
-        self.root.title("UCopy 设置")
-        self.root.resizable(False, False)
+        self.win = tk.Toplevel(master)
+        self.win.title("UCopy 设置")
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self.on_close)
 
         cfg = app.config
 
         # 目标目录
-        ttk.Label(self.root, text="目标目录 (必填):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self.win, text="目标目录 (必填):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.target_var = tk.StringVar(value=cfg["target_folder"])
-        ttk.Entry(self.root, textvariable=self.target_var, width=40).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(self.root, text="浏览", command=self.browse_target).grid(row=0, column=2, padx=5)
+        ttk.Entry(self.win, textvariable=self.target_var, width=40).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(self.win, text="浏览", command=self.browse_target).grid(row=0, column=2, padx=5)
 
         # 总量限制
-        ttk.Label(self.root, text="最大文件数 (0=不限):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self.win, text="最大文件数 (0=不限):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.max_files_var = tk.IntVar(value=cfg["max_total_files"])
-        ttk.Entry(self.root, textvariable=self.max_files_var, width=10).grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Entry(self.win, textvariable=self.max_files_var, width=10).grid(row=1, column=1, sticky="w", padx=5)
 
-        ttk.Label(self.root, text="最大总大小(MB) (0=不限):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self.win, text="最大总大小(MB) (0=不限):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
         self.max_size_var = tk.IntVar(value=cfg["max_total_size_mb"])
-        ttk.Entry(self.root, textvariable=self.max_size_var, width=10).grid(row=2, column=1, sticky="w", padx=5)
+        ttk.Entry(self.win, textvariable=self.max_size_var, width=10).grid(row=2, column=1, sticky="w", padx=5)
 
         # 单文件限制
-        ttk.Label(self.root, text="跳过单文件大于(MB) (0=不限):").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self.win, text="跳过单文件大于(MB) (0=不限):").grid(row=3, column=0, sticky="w", padx=5, pady=5)
         self.single_var = tk.IntVar(value=cfg["max_single_file_mb"])
-        ttk.Entry(self.root, textvariable=self.single_var, width=10).grid(row=3, column=1, sticky="w", padx=5)
+        ttk.Entry(self.win, textvariable=self.single_var, width=10).grid(row=3, column=1, sticky="w", padx=5)
 
         # 目标空间限制
-        ttk.Label(self.root, text="目标空间不足(MB)不复制:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self.win, text="目标空间不足(MB)不复制:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
         self.space_var = tk.IntVar(value=cfg["min_free_space_mb"])
-        ttk.Entry(self.root, textvariable=self.space_var, width=10).grid(row=4, column=1, sticky="w", padx=5)
+        ttk.Entry(self.win, textvariable=self.space_var, width=10).grid(row=4, column=1, sticky="w", padx=5)
 
         # 文件过滤
-        ttk.Label(self.root, text="扩展名 (如 .jpg,.png):").grid(row=5, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self.win, text="扩展名 (如 .jpg,.png):").grid(row=5, column=0, sticky="w", padx=5, pady=5)
         self.ext_var = tk.StringVar(value=cfg["extensions"])
-        ttk.Entry(self.root, textvariable=self.ext_var, width=20).grid(row=5, column=1, sticky="w", padx=5)
+        ttk.Entry(self.win, textvariable=self.ext_var, width=20).grid(row=5, column=1, sticky="w", padx=5)
 
-        ttk.Label(self.root, text="文件名正则 (可空):").grid(row=6, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(self.win, text="文件名正则 (可空):").grid(row=6, column=0, sticky="w", padx=5, pady=5)
         self.regex_var = tk.StringVar(value=cfg["regex_pattern"])
-        ttk.Entry(self.root, textvariable=self.regex_var, width=20).grid(row=6, column=1, sticky="w", padx=5)
+        ttk.Entry(self.win, textvariable=self.regex_var, width=20).grid(row=6, column=1, sticky="w", padx=5)
 
         # 开机自启
         self.auto_var = tk.BooleanVar(value=cfg["auto_start"])
-        ttk.Checkbutton(self.root, text="开机自动启动", variable=self.auto_var).grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+        ttk.Checkbutton(self.win, text="开机自动启动", variable=self.auto_var).grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
         # 按钮
-        btn_frame = ttk.Frame(self.root)
+        btn_frame = ttk.Frame(self.win)
         btn_frame.grid(row=8, column=0, columnspan=3, pady=10)
         ttk.Button(btn_frame, text="保存并隐藏", command=self.save_and_hide).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="退出程序", command=self.app.quit_app).pack(side=tk.LEFT, padx=5)
 
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # 设置模态？不阻塞
+        self.win.grab_set()  # 强制置前
 
     def browse_target(self):
-        folder = filedialog.askdirectory()
+        folder = filedialog.askdirectory(parent=self.win)
         if folder:
             self.target_var.set(folder)
 
     def save_and_hide(self):
-        # 验证必填
         target = self.target_var.get().strip()
         if not target:
-            messagebox.showerror("错误", "目标目录不能为空")
+            messagebox.showerror("错误", "目标目录不能为空", parent=self.win)
             return
-        # 保存配置
         cfg = {
             "target_folder": target,
             "max_total_files": self.max_files_var.get(),
@@ -431,10 +393,10 @@ class SettingsWindow:
         save_config(cfg)
         self.app.config = cfg
         set_auto_start(cfg["auto_start"])
-        self.root.withdraw()  # 隐藏设置窗口（通过托盘菜单重新打开）
+        self.win.destroy()
 
     def on_close(self):
-        self.root.withdraw()
+        self.win.destroy()
 
 # ---------- 入口 ----------
 if __name__ == "__main__":
