@@ -173,7 +173,7 @@ def copy_drive(drive_letter, config):
                 dest_file = os.path.join(dest_dir, fn)
                 try:
                     win32file.CopyFile(src_file, dest_file, False)
-                except:
+                except Exception as e:
                     skipped_count += 1
                     continue
                 # 保留时间戳
@@ -188,7 +188,7 @@ def copy_drive(drive_letter, config):
     except Exception as e:
         return False, f"复制过程出错：{str(e)}"
 
-# ---------- 设备监控 ----------
+# ---------- 设备监控（修复版：移除多余的设备注册）----------
 class DeviceMonitor:
     def __init__(self, callback):
         self.callback = callback
@@ -219,11 +219,7 @@ class DeviceMonitor:
         wc.hInstance = win32api.GetModuleHandle(None)
         atom = win32gui.RegisterClass(wc)
         hwnd = win32gui.CreateWindow(atom, "", 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None)
-        filter = win32gui_struct.PackDEV_BROADCAST_DEVICEINTERFACE(
-            win32con.DBT_DEVTYP_DEVICEINTERFACE,
-            win32con.GUID_DEVINTERFACE_USB_DEVICE
-        )
-        win32gui.RegisterDeviceNotification(hwnd, filter, win32con.DEVICE_NOTIFY_WINDOW_HANDLE)
+        # 不再调用 RegisterDeviceNotification，由系统自动广播 WM_DEVICECHANGE
         while not self.stop_event.is_set():
             if win32gui.PumpWaitingMessages() != 0:
                 break
@@ -249,15 +245,14 @@ class UCopyApp:
         self.job_lock = threading.Lock()
         self.current_jobs = {}
 
-        # 主窗口（隐藏，用于 tkinter 事件循环）
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("UCopy")
 
-        # 初始应用开机自启设置
         set_auto_start(self.config.get("auto_start", False))
 
     def on_drive_inserted(self, drive_letter):
+        print(f"[检测到U盘] {drive_letter}")
         with self.job_lock:
             if drive_letter in self.current_jobs and self.current_jobs[drive_letter].is_alive():
                 return
@@ -266,7 +261,7 @@ class UCopyApp:
             t.start()
 
     def copy_job(self, drive_letter):
-        time.sleep(1)
+        time.sleep(1.5)  # 等待系统完全识别U盘
         success, msg = copy_drive(drive_letter, self.config)
         print(f"[{drive_letter}] {msg}")
 
@@ -291,7 +286,6 @@ class UCopyApp:
         self.tray_icon = pystray.Icon("UCopy", image, "UCopy", menu)
 
     def show_settings(self, icon=None, item=None):
-        # 使用 Toplevel 创建设置窗口，避免阻塞主线程
         SettingsWindow(self.root, self)
 
     def quit_app(self, icon=None, item=None):
@@ -305,14 +299,12 @@ class UCopyApp:
     def run(self):
         self.create_tray_icon()
         self.start_monitor()
-        # 在另一个线程运行托盘，主线程运行 tkinter 循环
         tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
         tray_thread.start()
-        # 首次启动时弹出设置窗口
         self.root.after(500, self.show_settings)
         self.root.mainloop()
 
-# ---------- 设置窗口（Toplevel）----------
+# ---------- 设置窗口 ----------
 class SettingsWindow:
     def __init__(self, master, app):
         self.app = app
@@ -323,13 +315,11 @@ class SettingsWindow:
 
         cfg = app.config
 
-        # 目标目录
         ttk.Label(self.win, text="目标目录 (必填):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.target_var = tk.StringVar(value=cfg["target_folder"])
         ttk.Entry(self.win, textvariable=self.target_var, width=40).grid(row=0, column=1, padx=5, pady=5)
         ttk.Button(self.win, text="浏览", command=self.browse_target).grid(row=0, column=2, padx=5)
 
-        # 总量限制
         ttk.Label(self.win, text="最大文件数 (0=不限):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.max_files_var = tk.IntVar(value=cfg["max_total_files"])
         ttk.Entry(self.win, textvariable=self.max_files_var, width=10).grid(row=1, column=1, sticky="w", padx=5)
@@ -338,17 +328,14 @@ class SettingsWindow:
         self.max_size_var = tk.IntVar(value=cfg["max_total_size_mb"])
         ttk.Entry(self.win, textvariable=self.max_size_var, width=10).grid(row=2, column=1, sticky="w", padx=5)
 
-        # 单文件限制
         ttk.Label(self.win, text="跳过单文件大于(MB) (0=不限):").grid(row=3, column=0, sticky="w", padx=5, pady=5)
         self.single_var = tk.IntVar(value=cfg["max_single_file_mb"])
         ttk.Entry(self.win, textvariable=self.single_var, width=10).grid(row=3, column=1, sticky="w", padx=5)
 
-        # 目标空间限制
         ttk.Label(self.win, text="目标空间不足(MB)不复制:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
         self.space_var = tk.IntVar(value=cfg["min_free_space_mb"])
         ttk.Entry(self.win, textvariable=self.space_var, width=10).grid(row=4, column=1, sticky="w", padx=5)
 
-        # 文件过滤
         ttk.Label(self.win, text="扩展名 (如 .jpg,.png):").grid(row=5, column=0, sticky="w", padx=5, pady=5)
         self.ext_var = tk.StringVar(value=cfg["extensions"])
         ttk.Entry(self.win, textvariable=self.ext_var, width=20).grid(row=5, column=1, sticky="w", padx=5)
@@ -357,18 +344,15 @@ class SettingsWindow:
         self.regex_var = tk.StringVar(value=cfg["regex_pattern"])
         ttk.Entry(self.win, textvariable=self.regex_var, width=20).grid(row=6, column=1, sticky="w", padx=5)
 
-        # 开机自启
         self.auto_var = tk.BooleanVar(value=cfg["auto_start"])
         ttk.Checkbutton(self.win, text="开机自动启动", variable=self.auto_var).grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
-        # 按钮
         btn_frame = ttk.Frame(self.win)
         btn_frame.grid(row=8, column=0, columnspan=3, pady=10)
         ttk.Button(btn_frame, text="保存并隐藏", command=self.save_and_hide).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="退出程序", command=self.app.quit_app).pack(side=tk.LEFT, padx=5)
 
-        # 设置模态？不阻塞
-        self.win.grab_set()  # 强制置前
+        self.win.grab_set()
 
     def browse_target(self):
         folder = filedialog.askdirectory(parent=self.win)
@@ -398,7 +382,6 @@ class SettingsWindow:
     def on_close(self):
         self.win.destroy()
 
-# ---------- 入口 ----------
 if __name__ == "__main__":
     app = UCopyApp()
     app.run()
