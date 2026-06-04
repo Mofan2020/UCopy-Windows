@@ -5,6 +5,8 @@ import json
 import time
 import datetime
 import threading
+import logging
+import logging.handlers
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -29,7 +31,7 @@ DEFAULT_CONFIG = {
     "extensions": "",
     "regex_pattern": "",
     "auto_start": False,
-    "known_devices": {}   # { guid: {"label":..., "first_seen":..., "blacklisted": False} }
+    "known_devices": {}
 }
 
 def get_config():
@@ -69,24 +71,37 @@ def set_auto_start(enable):
     win32api.RegCloseKey(key)
 
 def get_drive_info(drive_letter):
-    """返回 (卷标, GUID唯一标识)"""
+    """
+    获取U盘的卷标和唯一标识符
+    返回 (label, unique_id)
+    优先使用GUID，失败则使用序列号+卷标组合
+    """
     try:
-        label, _, _, _, _ = win32api.GetVolumeInformation(drive_letter + "\\")
-        label = label or "无卷标"
+        label, _, serial, _, _ = win32api.GetVolumeInformation(drive_letter + "\\")
+        label = label.strip() if label else "无卷标"
     except:
         label = "未知磁盘"
-    # 获取卷GUID路径: \\?\Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\
+        serial = 0
+
+    # 尝试获取GUID路径
+    guid = None
     try:
-        vol_path = win32api.GetVolumeNameForVolumeMountPoint(drive_letter + "\\")
-        # 提取GUID部分
-        guid = vol_path.strip("\\").strip("\\").split("\\")[-1]  # 得到 Volume{...}
-        if guid.startswith("Volume"):
-            guid = guid[7:-1]  # 去掉 Volume{ 和 }
-        else:
-            guid = "unknown"
-    except:
-        guid = "unknown"
-    return label, guid
+        # 必须传入 "X:\" 格式，注意结尾反斜杠
+        vol_path = win32file.GetVolumeNameForVolumeMountPoint(drive_letter + "\\")
+        # vol_path 格式: \\?\Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\
+        vol_guid = vol_path.strip("\\").strip("\\").split("\\")[-1]
+        if vol_guid.startswith("Volume{") and vol_guid.endswith("}"):
+            guid = vol_guid[7:-1]  # 提取纯GUID字符串
+    except Exception as e:
+        logging.getLogger("UCopy").debug(f"获取GUID失败: {e}")
+
+    if guid:
+        unique_id = guid
+    else:
+        # 回退：使用序列号+卷标，为避免碰撞加上卷标hash
+        unique_id = f"{serial:08X}_{label.replace(' ', '_')}"
+
+    return label, unique_id
 
 def get_free_space_mb(path):
     if not os.path.exists(path):
@@ -128,42 +143,43 @@ def should_copy_file(filename, extensions, pattern):
             return False
     return True
 
-def copy_drive(drive_letter, config, log_writer):
-    """执行复制并记录日志，返回 (success, message)"""
+def copy_drive(drive_letter, config):
+    """执行复制，返回 (success, message)"""
+    logger = logging.getLogger("UCopy")
     target_base = config["target_folder"]
     if not target_base:
         return False, "未设置目标目录"
 
-    label, guid = get_drive_info(drive_letter)
-    dest_root = os.path.join(target_base, f"{label}_{guid}")
+    label, unique_id = get_drive_info(drive_letter)
+    dest_root = os.path.join(target_base, f"{label}_{unique_id}")
     src_root = drive_letter + "\\"
 
-    log_writer(f"开始复制 U盘 [{label}] GUID: {guid}")
-    log_writer(f"源路径: {src_root}  ->  目标: {dest_root}")
+    logger.info(f"开始复制 U盘 [{label}] (ID: {unique_id})")
+    logger.debug(f"源: {src_root}  目标: {dest_root}")
 
-    # 检查目标空间
+    # 目标空间检查
     min_free = config.get("min_free_space_mb", 0)
     if min_free > 0:
         check_path = target_base if os.path.exists(target_base) else os.path.dirname(target_base)
         free_mb = get_free_space_mb(check_path)
         if free_mb < min_free:
             msg = f"目标磁盘空间不足（剩余 {free_mb} MB，要求 {min_free} MB）"
-            log_writer("错误: " + msg)
+            logger.error(msg)
             return False, msg
 
-    # 计算总量
+    # 总量检查
     total_files, total_size = get_total_files_and_size(src_root)
-    log_writer(f"文件总数: {total_files}, 总大小: {total_size/(1024*1024):.2f} MB")
+    logger.info(f"扫描完成：{total_files} 个文件，总大小 {total_size/(1024*1024):.2f} MB")
     max_files = config.get("max_total_files", 0)
     max_size_mb = config.get("max_total_size_mb", 0)
 
     if max_files > 0 and total_files > max_files:
         msg = f"文件数量超过限制（{total_files} > {max_files}）"
-        log_writer("跳过: " + msg)
+        logger.warning(msg)
         return False, msg
     if max_size_mb > 0 and total_size > max_size_mb * 1024 * 1024:
         msg = f"总大小超过限制（{total_size/(1024*1024):.1f} MB > {max_size_mb} MB）"
-        log_writer("跳过: " + msg)
+        logger.warning(msg)
         return False, msg
 
     max_single_mb = config.get("max_single_file_mb", 0)
@@ -185,19 +201,19 @@ def copy_drive(drive_letter, config, log_writer):
                 try:
                     file_size = os.path.getsize(src_file)
                 except OSError:
-                    log_writer(f"跳过: 无法获取大小 - {src_file}")
+                    logger.warning(f"无法获取文件大小，跳过: {src_file}")
                     skipped_count += 1
                     continue
 
                 # 单文件大小过滤
                 if max_single_bytes and file_size > max_single_bytes:
-                    log_writer(f"跳过: 文件过大 ({file_size/(1024*1024):.2f} MB) - {src_file}")
+                    logger.info(f"跳过(过大): {src_file} ({file_size/(1024*1024):.2f} MB)")
                     skipped_count += 1
                     continue
 
                 # 扩展名/正则过滤
                 if not should_copy_file(fn, ext_filter, regex_filter):
-                    log_writer(f"跳过: 不符合过滤规则 - {src_file}")
+                    logger.info(f"跳过(过滤): {src_file}")
                     skipped_count += 1
                     continue
 
@@ -205,7 +221,6 @@ def copy_drive(drive_letter, config, log_writer):
                 temp_file = dest_file + ".ucopy"
 
                 try:
-                    # 先复制到临时文件
                     win32file.CopyFile(src_file, temp_file, False)
                     # 保留时间戳
                     try:
@@ -213,28 +228,64 @@ def copy_drive(drive_letter, config, log_writer):
                         os.utime(temp_file, (st.st_atime, st.st_mtime))
                     except:
                         pass
-                    # 重命名为正式文件
                     os.rename(temp_file, dest_file)
-                    log_writer(f"复制成功: {src_file} -> {dest_file}")
+                    logger.info(f"复制成功: {src_file} -> {dest_file}")
                     copied_count += 1
                 except Exception as e:
-                    # 清理可能的临时文件
                     if os.path.exists(temp_file):
                         try:
                             os.remove(temp_file)
                         except:
                             pass
-                    log_writer(f"复制失败 ({e}): {src_file}")
+                    logger.error(f"复制失败 ({e}): {src_file}")
                     skipped_count += 1
                     continue
 
         msg = f"复制完成：{copied_count} 个文件，跳过 {skipped_count} 个"
-        log_writer(msg)
+        logger.info(msg)
         return True, msg
     except Exception as e:
-        msg = f"复制过程出错：{str(e)}"
-        log_writer("错误: " + msg)
+        msg = f"复制过程异常: {str(e)}"
+        logger.exception(msg)
         return False, msg
+
+# ---------- 全局日志系统（每2小时轮转）----------
+class TimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """自定义轮转规则：每2小时生成新日志文件"""
+    pass
+
+def setup_logger(target_folder):
+    """在目标目录下设置日志，每2小时轮转"""
+    logger = logging.getLogger("UCopy")
+    logger.setLevel(logging.DEBUG)
+
+    # 避免重复添加handler
+    if logger.handlers:
+        return logger
+
+    log_dir = target_folder if target_folder else os.path.expanduser("~")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "UCopy.log")
+
+    # 使用 TimedRotatingFileHandler，每2小时轮转，保留30天
+    handler = logging.handlers.TimedRotatingFileHandler(
+        log_file, when="h", interval=2, backupCount=360, encoding="utf-8"
+    )
+    handler.suffix = "%Y%m%d_%H%M%S"
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    # 同时输出到控制台（可选）
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(formatter)
+    logger.addHandler(console)
+
+    return logger
 
 # ---------- 设备监控 ----------
 class DeviceMonitor:
@@ -287,6 +338,7 @@ class DeviceMonitor:
 class UCopyApp:
     def __init__(self):
         self.config = get_config()
+        self.logger = None
         self.monitor = None
         self.tray_icon = None
         self.job_lock = threading.Lock()
@@ -298,67 +350,62 @@ class UCopyApp:
 
         set_auto_start(self.config.get("auto_start", False))
 
+    def init_logger(self):
+        target = self.config.get("target_folder", "")
+        self.logger = setup_logger(target)
+        self.logger.info("UCopy 启动")
+        self.logger.debug(f"配置文件路径: {CONFIG_PATH}")
+        self.logger.debug(f"目标目录: {target if target else '未设置'}")
+
     def on_drive_inserted(self, drive_letter):
-        print(f"[检测到U盘] {drive_letter}")
+        self.logger.info(f"检测到U盘插入: {drive_letter}")
         time.sleep(1.5)  # 等待系统完全识别
 
-        label, guid = get_drive_info(drive_letter)
+        label, unique_id = get_drive_info(drive_letter)
+        self.logger.info(f"U盘信息: 卷标={label}, 唯一ID={unique_id}")
+
         # 更新已知设备列表
         known = self.config.setdefault("known_devices", {})
-        if guid not in known:
-            known[guid] = {
+        if unique_id not in known:
+            known[unique_id] = {
                 "label": label,
                 "first_seen": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "blacklisted": False
             }
+            self.logger.info(f"新设备已记录: {label} ({unique_id})")
+            save_config(self.config)
+        else:
+            # 更新标签（可能发生了变化）
+            known[unique_id]["label"] = label
             save_config(self.config)
 
         # 检查黑名单
-        if known[guid].get("blacklisted", False):
-            print(f"U盘 {label} ({guid}) 在黑名单中，跳过复制")
+        if known[unique_id].get("blacklisted", False):
+            self.logger.info(f"U盘 {label} 在黑名单中，跳过复制")
             return
 
+        # 启动复制线程
         with self.job_lock:
             if drive_letter in self.current_jobs and self.current_jobs[drive_letter].is_alive():
+                self.logger.info(f"该U盘已有复制任务正在运行，忽略重复插入")
                 return
             t = threading.Thread(target=self.copy_job, args=(drive_letter,), daemon=True)
             self.current_jobs[drive_letter] = t
             t.start()
 
     def copy_job(self, drive_letter):
-        target = self.config["target_folder"]
-        if not target:
-            print("未设置目标目录，无法复制")
-            return
-
-        # 创建日志文件
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = f"UCopy_{timestamp}.log"
-        log_path = os.path.join(target, log_filename)
-        log_file = open(log_path, "a", encoding="utf-8")
-        def log_writer(msg):
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            line = f"[{now}] {msg}"
-            print(line)
-            log_file.write(line + "\n")
-            log_file.flush()
-
-        try:
-            success, msg = copy_drive(drive_letter, self.config, log_writer)
-            if success:
-                print(f"[{drive_letter}] {msg}")
-            else:
-                print(f"[{drive_letter}] 失败: {msg}")
-        finally:
-            log_file.close()
+        success, msg = copy_drive(drive_letter, self.config)
+        self.logger.info(f"复制任务结束 ({drive_letter}): {msg}")
 
     def start_monitor(self):
         if self.monitor is None:
+            self.logger.info("设备监控已启动")
             self.monitor = DeviceMonitor(self.on_drive_inserted)
             self.monitor.start()
 
     def stop_monitor(self):
         if self.monitor:
+            self.logger.info("设备监控已停止")
             self.monitor.stop()
             self.monitor = None
 
@@ -376,6 +423,7 @@ class UCopyApp:
         SettingsWindow(self.root, self)
 
     def quit_app(self, icon=None, item=None):
+        self.logger.info("用户请求退出程序")
         self.stop_monitor()
         if self.tray_icon:
             self.tray_icon.stop()
@@ -384,6 +432,7 @@ class UCopyApp:
         sys.exit(0)
 
     def run(self):
+        self.init_logger()
         self.create_tray_icon()
         self.start_monitor()
         tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
@@ -391,7 +440,7 @@ class UCopyApp:
         self.root.after(500, self.show_settings)
         self.root.mainloop()
 
-# ---------- 设置窗口（含黑名单管理）----------
+# ---------- 设置窗口 ----------
 class SettingsWindow:
     def __init__(self, master, app):
         self.app = app
@@ -402,7 +451,7 @@ class SettingsWindow:
 
         cfg = app.config
 
-        # ---------- 基本设置 ----------
+        # 基本设置
         frame_basic = ttk.LabelFrame(self.win, text="基本设置", padding=5)
         frame_basic.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
 
@@ -438,7 +487,7 @@ class SettingsWindow:
         self.auto_var = tk.BooleanVar(value=cfg["auto_start"])
         ttk.Checkbutton(frame_basic, text="开机自动启动", variable=self.auto_var).grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
-        # ---------- 黑名单管理 ----------
+        # 黑名单管理
         frame_black = ttk.LabelFrame(self.win, text="已识别U盘 (勾选后不再复制)", padding=5)
         frame_black.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
 
@@ -450,12 +499,11 @@ class SettingsWindow:
 
         self.refresh_device_list()
 
-        # 黑名单操作按钮
         btn_frame_black = ttk.Frame(self.win)
         btn_frame_black.grid(row=2, column=0, columnspan=2, pady=5)
         ttk.Button(btn_frame_black, text="切换黑名单状态", command=self.toggle_blacklist).pack(side=tk.LEFT, padx=5)
 
-        # ---------- 保存/退出 ----------
+        # 底部按钮
         btn_frame = ttk.Frame(self.win)
         btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
         ttk.Button(btn_frame, text="保存并隐藏", command=self.save_and_hide).pack(side=tk.LEFT, padx=5)
@@ -471,25 +519,22 @@ class SettingsWindow:
     def refresh_device_list(self):
         self.device_listbox.delete(0, tk.END)
         known = self.app.config.get("known_devices", {})
-        for guid, info in known.items():
+        for uid, info in known.items():
             label = info.get("label", "?")
-            blacklisted = info.get("blacklisted", False)
-            display_text = f"{label}  [{guid}]  {'[黑名单]' if blacklisted else '[正常]'}"
-            self.device_listbox.insert(tk.END, display_text)
+            black = info.get("blacklisted", False)
+            display = f"{label}  [{uid}]  {'[黑名单]' if black else '[正常]'}"
+            self.device_listbox.insert(tk.END, display)
 
     def toggle_blacklist(self):
         selected = self.device_listbox.curselection()
         if not selected:
-            messagebox.showinfo("提示", "请先在列表中选择至少一个U盘")
+            messagebox.showinfo("提示", "请先选择U盘")
             return
-
         known = self.app.config.get("known_devices", {})
-        # 获取选中的 guid
-        all_items = list(known.items())
+        items = list(known.items())
         for idx in selected:
-            if idx < len(all_items):
-                guid, info = all_items[idx]
-                # 切换状态
+            if idx < len(items):
+                uid, info = items[idx]
                 info["blacklisted"] = not info.get("blacklisted", False)
         save_config(self.app.config)
         self.refresh_device_list()
@@ -499,6 +544,17 @@ class SettingsWindow:
         if not target:
             messagebox.showerror("错误", "目标目录不能为空", parent=self.win)
             return
+        # 如果目标目录变更，需要更新日志路径
+        old_target = self.app.config.get("target_folder", "")
+        if target != old_target:
+            self.app.logger.info(f"目标目录已更改: {old_target} -> {target}")
+            # 重新配置日志
+            new_logger = setup_logger(target)
+            for handler in self.app.logger.handlers[:]:
+                self.app.logger.removeHandler(handler)
+            for handler in new_logger.handlers:
+                self.app.logger.addHandler(handler)
+
         cfg = {
             "target_folder": target,
             "max_total_files": self.max_files_var.get(),
@@ -508,11 +564,12 @@ class SettingsWindow:
             "extensions": self.ext_var.get().strip(),
             "regex_pattern": self.regex_var.get().strip(),
             "auto_start": self.auto_var.get(),
-            "known_devices": self.app.config.get("known_devices", {})  # 保留黑名单数据
+            "known_devices": self.app.config.get("known_devices", {})
         }
         save_config(cfg)
         self.app.config = cfg
         set_auto_start(cfg["auto_start"])
+        self.app.logger.info("设置已保存")
         self.win.destroy()
 
     def on_close(self):
