@@ -624,6 +624,7 @@ class LoginWindow:
         self.app = app
         self.on_success = on_success
         self.attempts = 0
+        self._locked = False  # 触顶后置 True，幂等保护
         self.win = tk.Toplevel(master)
         self.win.title("UCopy - 验证密码")
         self.win.resizable(False, False)
@@ -657,6 +658,8 @@ class LoginWindow:
         self.app.quit_app()
 
     def verify(self):
+        if self._locked:
+            return
         sec = self.app.config.get("security", {})
         salt = sec.get("password_salt", "")
         expected = sec.get("password_hash", "")
@@ -672,15 +675,37 @@ class LoginWindow:
 
         self.attempts += 1
         left = self.MAX_ATTEMPTS - self.attempts
+        try:
+            self.app.logger.warning(
+                f"设置面板密码错误（第 {self.attempts}/{self.MAX_ATTEMPTS} 次）"
+            )
+        except Exception:
+            pass
         if left <= 0:
-            messagebox.showerror("错误", "密码错误次数过多，程序将退出", parent=self.win)
+            # 达到上限：仅关闭密码窗口，程序与后台 U 盘复制继续运行，
+            # 留下审计日志供事后追溯。需要再试可从托盘重新打开设置。
+            try:
+                self.app.logger.warning(
+                    f"设置面板密码连续 {self.MAX_ATTEMPTS} 次错误，临时锁定，"
+                    "U 盘复制功能未受影响"
+                )
+            except Exception:
+                pass
+            self._locked = True
             self.win.destroy()
-            self.app.quit_app()
+            messagebox.showerror(
+                "已临时锁定",
+                f"密码连续 {self.MAX_ATTEMPTS} 次错误，已关闭设置面板。\n"
+                "后台 U 盘复制功能继续运行，需要时可从托盘菜单重新打开设置。",
+                parent=self.app.root,
+            )
             return
         self.err_var.set(f"密码错误，还可尝试 {left} 次")
         self.pwd_var.set("")
 
     def forgot(self):
+        if self._locked:
+            return
         # 进入密保找回流程
         sec = self.app.config.get("security", {})
         qa = sec.get("qa", [])
