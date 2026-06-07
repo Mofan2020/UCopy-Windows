@@ -3,6 +3,8 @@ import sys
 import re
 import json
 import time
+import hashlib
+import secrets
 import datetime
 import threading
 import logging
@@ -22,6 +24,18 @@ from PIL import Image, ImageDraw
 # ---------- 全局配置 ----------
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ucopy_settings.json")
 
+# 预设密保问题（用户可从中选择，也可保留自填入口）
+SECURITY_QUESTIONS = [
+    "您的小学校名是？",
+    "您母亲的姓名是？",
+    "您出生地的城市名是？",
+    "您第一只宠物的名字是？",
+    "您最喜欢的电影是？",
+    "您小学最好朋友的名字是？",
+    "您初中班主任的姓名是？",
+    "您父亲的出生城市是？",
+]
+
 DEFAULT_CONFIG = {
     "target_folder": "",
     "max_total_files": 0,
@@ -31,8 +45,35 @@ DEFAULT_CONFIG = {
     "extensions": "",
     "regex_pattern": "",
     "auto_start": False,
-    "known_devices": {}
+    "known_devices": {},
+    "security": {
+        "password_hash": "",
+        "password_salt": "",
+        "qa": []  # [{"question": str, "answer_hash": str, "answer_salt": str}, ...]
+    }
 }
+
+# ---------- 密码 / 密保答案哈希 ----------
+def hash_secret(secret: str, salt: str = None):
+    """
+    对 secret（密码或密保答案）做 SHA-256 + 盐 哈希。
+    返回 (salt, hash_hex)。salt 不传则随机生成 32 字节 hex。
+    """
+    if salt is None:
+        salt = secrets.token_hex(16)
+    h = hashlib.sha256((salt + secret).encode("utf-8")).hexdigest()
+    return salt, h
+
+def verify_secret(secret: str, salt: str, expected_hash: str) -> bool:
+    """校验 secret 与已存的 salt+hash 是否一致。"""
+    if not salt or not expected_hash:
+        return False
+    _, h = hash_secret(secret, salt)
+    return h == expected_hash
+
+def normalize_answer(answer: str) -> str:
+    """密保答案归一化：去首尾空格 + 转为小写（中文不受影响，但允许大小写不敏感匹配英文等）"""
+    return answer.strip().lower()
 
 def get_config():
     if not os.path.exists(CONFIG_PATH):
@@ -40,10 +81,19 @@ def get_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-            for k, v in DEFAULT_CONFIG.items():
-                if k not in cfg:
-                    cfg[k] = v
-            return cfg
+        for k, v in DEFAULT_CONFIG.items():
+            if k not in cfg:
+                cfg[k] = v if not isinstance(v, (dict, list)) else (
+                    {**v} if isinstance(v, dict) else list(v)
+                )
+        # 进一步补齐嵌套字段
+        sec = cfg.setdefault("security", {})
+        for k, v in DEFAULT_CONFIG["security"].items():
+            if k not in sec:
+                sec[k] = v if not isinstance(v, (dict, list)) else (
+                    {**v} if isinstance(v, dict) else list(v)
+                )
+        return cfg
     except:
         return DEFAULT_CONFIG.copy()
 
@@ -420,7 +470,20 @@ class UCopyApp:
         self.tray_icon = pystray.Icon("UCopy", image, "UCopy", menu)
 
     def show_settings(self, icon=None, item=None):
-        SettingsWindow(self.root, self)
+        """
+        打开设置面板的统一入口：
+          - 若未设置过密码，强制进入 SecuritySetupWindow
+          - 若已设置，弹 LoginWindow 校验密码
+          - 校验通过后回调进入 SettingsWindow
+        """
+        def _open_settings():
+            SettingsWindow(self.root, self)
+
+        sec = self.config.get("security", {})
+        if not sec.get("password_hash"):
+            SecuritySetupWindow(self.root, self, on_success=_open_settings)
+        else:
+            LoginWindow(self.root, self, on_success=_open_settings)
 
     def quit_app(self, icon=None, item=None):
         self.logger.info("用户请求退出程序")
@@ -439,6 +502,462 @@ class UCopyApp:
         tray_thread.start()
         self.root.after(500, self.show_settings)
         self.root.mainloop()
+
+# ---------- 密码设置窗口（首次强制） ----------
+class SecuritySetupWindow:
+    """
+    首次打开设置面板前强制要求：设置登录密码 + 3 个密保问题。
+    关闭窗口必须完成设置（target=modal 阻塞）。
+    """
+    MIN_PASSWORD_LEN = 4
+    QA_COUNT = 3
+
+    def __init__(self, master, app, on_success):
+        self.app = app
+        self.on_success = on_success  # 回调：完成设置后进入 SettingsWindow
+        self.win = tk.Toplevel(master)
+        self.win.title("UCopy 安全设置")
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self._block_close)
+
+        ttk.Label(
+            self.win,
+            text="首次使用，请设置登录密码与密保问题",
+            font=("", 10, "bold")
+        ).grid(row=0, column=0, columnspan=3, padx=10, pady=(10, 6), sticky="w")
+
+        # ---- 密码 ----
+        frm_pwd = ttk.LabelFrame(self.win, text="设置登录密码", padding=5)
+        frm_pwd.grid(row=1, column=0, columnspan=3, padx=10, pady=5, sticky="ew")
+
+        ttk.Label(frm_pwd, text=f"密码（至少 {self.MIN_PASSWORD_LEN} 位）:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self.pwd_var = tk.StringVar()
+        ttk.Entry(frm_pwd, textvariable=self.pwd_var, show="*", width=24).grid(row=0, column=1, padx=5)
+
+        ttk.Label(frm_pwd, text="确认密码:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        self.pwd2_var = tk.StringVar()
+        ttk.Entry(frm_pwd, textvariable=self.pwd2_var, show="*", width=24).grid(row=1, column=1, padx=5)
+
+        ttk.Label(frm_pwd, text="提示: 密码用于保护设置面板，请妥善保管。",
+                  foreground="gray").grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 0))
+
+        # ---- 密保 ----
+        frm_qa = ttk.LabelFrame(self.win, text=f"密保问题（请设置 {self.QA_COUNT} 个，用于找回密码）", padding=5)
+        frm_qa.grid(row=2, column=0, columnspan=3, padx=10, pady=5, sticky="ew")
+
+        self.q_vars = []   # List[(question_var, answer_var)]
+        for i in range(self.QA_COUNT):
+            q_var = tk.StringVar(value=SECURITY_QUESTIONS[i])
+            a_var = tk.StringVar()
+            ttk.Label(frm_qa, text=f"问题 {i + 1}:").grid(row=i, column=0, sticky="w", padx=5, pady=2)
+            q_combo = ttk.Combobox(frm_qa, textvariable=q_var, values=SECURITY_QUESTIONS,
+                                   width=30, state="normal")
+            q_combo.grid(row=i, column=1, padx=5, pady=2)
+            ttk.Label(frm_qa, text="答案:").grid(row=i, column=2, sticky="w", padx=5, pady=2)
+            ttk.Entry(frm_qa, textvariable=a_var, show="*", width=20).grid(row=i, column=3, padx=5, pady=2)
+            self.q_vars.append((q_var, a_var))
+
+        ttk.Label(frm_qa, text="提示: 答案不区分大小写，请设置您能记住的固定答案。",
+                  foreground="gray").grid(row=self.QA_COUNT, column=0, columnspan=4,
+                                            sticky="w", padx=5, pady=(2, 0))
+
+        # ---- 提交 ----
+        btn_frame = ttk.Frame(self.win)
+        btn_frame.grid(row=3, column=0, columnspan=3, pady=10)
+        ttk.Button(btn_frame, text="保存并进入设置", command=self.save).pack(side=tk.LEFT, padx=5)
+
+        self.win.grab_set()
+        self.win.transient(master)
+
+    def _block_close(self):
+        messagebox.showwarning("必须设置", "请先完成密码与密保设置，才能使用本程序。", parent=self.win)
+
+    def save(self):
+        pwd = self.pwd_var.get()
+        pwd2 = self.pwd2_var.get()
+        if len(pwd) < self.MIN_PASSWORD_LEN:
+            messagebox.showerror("错误", f"密码长度不能少于 {self.MIN_PASSWORD_LEN} 位", parent=self.win)
+            return
+        if pwd != pwd2:
+            messagebox.showerror("错误", "两次输入的密码不一致", parent=self.win)
+            return
+
+        # 收集密保
+        qa = []
+        for i, (q_var, a_var) in enumerate(self.q_vars):
+            q = q_var.get().strip()
+            a = a_var.get()
+            if not q:
+                messagebox.showerror("错误", f"第 {i + 1} 个密保问题不能为空", parent=self.win)
+                return
+            if not a.strip():
+                messagebox.showerror("错误", f"第 {i + 1} 个密保答案不能为空", parent=self.win)
+                return
+            salt, h = hash_secret(normalize_answer(a))
+            qa.append({"question": q, "answer_hash": h, "answer_salt": salt})
+
+        pwd_salt, pwd_hash = hash_secret(pwd)
+        self.app.config["security"] = {
+            "password_hash": pwd_hash,
+            "password_salt": pwd_salt,
+            "qa": qa
+        }
+        save_config(self.app.config)
+        try:
+            self.app.logger.info("安全设置已初始化（密码 + 密保问题）")
+        except Exception:
+            pass
+        self.win.destroy()
+        if self.on_success:
+            self.on_success()
+
+
+# ---------- 登录窗口（每次进入设置前） ----------
+class LoginWindow:
+    """
+    校验登录密码。校验通过后回调 on_success 进入 SettingsWindow。
+    忘记密码入口：跳到 ForgotPasswordWindow，走密保问题校验后重置密码。
+    """
+    MAX_ATTEMPTS = 5  # 失败超过次数强制退出
+
+    def __init__(self, master, app, on_success):
+        self.app = app
+        self.on_success = on_success
+        self.attempts = 0
+        self.win = tk.Toplevel(master)
+        self.win.title("UCopy - 验证密码")
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self.cancel_and_quit)
+
+        ttk.Label(self.win, text="请输入登录密码以进入设置面板",
+                  font=("", 10)).grid(row=0, column=0, columnspan=2, padx=20, pady=(15, 6))
+
+        self.pwd_var = tk.StringVar()
+        entry = ttk.Entry(self.win, textvariable=self.pwd_var, show="*", width=28)
+        entry.grid(row=1, column=0, columnspan=2, padx=20, pady=5)
+        entry.focus_set()
+
+        self.err_var = tk.StringVar(value="")
+        ttk.Label(self.win, textvariable=self.err_var, foreground="red").grid(
+            row=2, column=0, columnspan=2, padx=20, pady=(0, 5))
+
+        btn_frame = ttk.Frame(self.win)
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
+        ttk.Button(btn_frame, text="确定", command=self.verify).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="忘记密码", command=self.forgot).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.cancel_and_quit).pack(side=tk.LEFT, padx=5)
+
+        self.win.bind("<Return>", lambda e: self.verify())
+        self.win.grab_set()
+        self.win.transient(master)
+
+    def cancel_and_quit(self):
+        """取消登录：直接退出整个应用（密码保护下不应让用户绕过）"""
+        self.win.destroy()
+        self.app.quit_app()
+
+    def verify(self):
+        sec = self.app.config.get("security", {})
+        salt = sec.get("password_salt", "")
+        expected = sec.get("password_hash", "")
+        if verify_secret(self.pwd_var.get(), salt, expected):
+            try:
+                self.app.logger.info("设置面板密码验证通过")
+            except Exception:
+                pass
+            self.win.destroy()
+            if self.on_success:
+                self.on_success()
+            return
+
+        self.attempts += 1
+        left = self.MAX_ATTEMPTS - self.attempts
+        if left <= 0:
+            messagebox.showerror("错误", "密码错误次数过多，程序将退出", parent=self.win)
+            self.win.destroy()
+            self.app.quit_app()
+            return
+        self.err_var.set(f"密码错误，还可尝试 {left} 次")
+        self.pwd_var.set("")
+
+    def forgot(self):
+        # 进入密保找回流程
+        sec = self.app.config.get("security", {})
+        qa = sec.get("qa", [])
+        if not qa:
+            messagebox.showerror("错误", "未配置密保问题，无法找回密码", parent=self.win)
+            return
+        self.win.withdraw()
+        ForgotPasswordWindow(self.win, self.app, qa, on_reset=self._on_reset_done)
+
+    def _on_reset_done(self):
+        """密保校验通过、重置密码后，回到登录窗口（让用户用新密码再登一次）"""
+        # 直接进入设置
+        if self.on_success:
+            self.on_success()
+        self.win.destroy()
+
+
+class ForgotPasswordWindow:
+    """
+    密保找回流程：依次回答所有密保问题，全部答对才能重置密码。
+    """
+    def __init__(self, master, app, qa, on_reset):
+        self.app = app
+        self.qa = qa
+        self.on_reset = on_reset  # 重置完成回调
+        self.win = tk.Toplevel(master)
+        self.win.title("找回密码")
+        self.win.resizable(False, False)
+        self.win.grab_set()
+        self.win.transient(master)
+
+        ttk.Label(
+            self.win,
+            text="请依次回答以下密保问题，全部答对后可重置密码",
+            font=("", 10)
+        ).grid(row=0, column=0, columnspan=2, padx=15, pady=(10, 5), sticky="w")
+
+        self.answer_vars = []
+        for i, item in enumerate(qa):
+            ttk.Label(self.win, text=f"{i + 1}. {item['question']}").grid(
+                row=1 + i, column=0, sticky="w", padx=10, pady=3)
+            a_var = tk.StringVar()
+            ttk.Entry(self.win, textvariable=a_var, show="*", width=24).grid(
+                row=1 + i, column=1, padx=10, pady=3)
+            self.answer_vars.append(a_var)
+
+        self.err_var = tk.StringVar(value="")
+        ttk.Label(self.win, textvariable=self.err_var, foreground="red").grid(
+            row=1 + len(qa), column=0, columnspan=2, padx=10, pady=(2, 4))
+
+        btn_frame = ttk.Frame(self.win)
+        btn_frame.grid(row=2 + len(qa), column=0, columnspan=2, pady=8)
+        ttk.Button(btn_frame, text="下一步", command=self.check_answers).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.cancel).pack(side=tk.LEFT, padx=5)
+
+    def check_answers(self):
+        wrong = []
+        for i, (item, a_var) in enumerate(zip(self.qa, self.answer_vars)):
+            ans = a_var.get()
+            if not verify_secret(normalize_answer(ans), item["answer_salt"], item["answer_hash"]):
+                wrong.append(i + 1)
+        if wrong:
+            self.err_var.set(f"第 {', '.join(map(str, wrong))} 题答案错误，请重试")
+            return
+        # 全部答对，进入重置密码
+        self.win.destroy()
+        ResetPasswordWindow(self.win.master, self.app, after_reset=self.on_reset)
+
+    def cancel(self):
+        self.win.destroy()
+        # 把登录窗口恢复显示
+        try:
+            self.win.master.deiconify()
+        except Exception:
+            pass
+
+
+class ResetPasswordWindow:
+    """通过密保后，重置新密码"""
+    MIN_PASSWORD_LEN = SecuritySetupWindow.MIN_PASSWORD_LEN
+
+    def __init__(self, master, app, after_reset):
+        self.app = app
+        self.after_reset = after_reset
+        self.win = tk.Toplevel(master)
+        self.win.title("重置密码")
+        self.win.resizable(False, False)
+        self.win.grab_set()
+        self.win.transient(master)
+
+        ttk.Label(self.win, text="密保校验通过，请设置新密码",
+                  font=("", 10)).grid(row=0, column=0, columnspan=2, padx=20, pady=(12, 6))
+
+        ttk.Label(self.win, text=f"新密码（至少 {self.MIN_PASSWORD_LEN} 位）:").grid(
+            row=1, column=0, sticky="w", padx=10, pady=4)
+        self.pwd_var = tk.StringVar()
+        ttk.Entry(self.win, textvariable=self.pwd_var, show="*", width=22).grid(
+            row=1, column=1, padx=10, pady=4)
+
+        ttk.Label(self.win, text="确认新密码:").grid(
+            row=2, column=0, sticky="w", padx=10, pady=4)
+        self.pwd2_var = tk.StringVar()
+        ttk.Entry(self.win, textvariable=self.pwd2_var, show="*", width=22).grid(
+            row=2, column=1, padx=10, pady=4)
+
+        btn_frame = ttk.Frame(self.win)
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
+        ttk.Button(btn_frame, text="重置", command=self.save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.cancel).pack(side=tk.LEFT, padx=5)
+
+    def save(self):
+        pwd = self.pwd_var.get()
+        pwd2 = self.pwd2_var.get()
+        if len(pwd) < self.MIN_PASSWORD_LEN:
+            messagebox.showerror("错误", f"密码长度不能少于 {self.MIN_PASSWORD_LEN} 位", parent=self.win)
+            return
+        if pwd != pwd2:
+            messagebox.showerror("错误", "两次输入的密码不一致", parent=self.win)
+            return
+        salt, h = hash_secret(pwd)
+        sec = self.app.config.setdefault("security", {})
+        sec["password_salt"] = salt
+        sec["password_hash"] = h
+        save_config(self.app.config)
+        try:
+            self.app.logger.info("密码已通过密保重置")
+        except Exception:
+            pass
+        messagebox.showinfo("完成", "密码已重置", parent=self.win)
+        self.win.destroy()
+        if self.after_reset:
+            self.after_reset()
+
+    def cancel(self):
+        self.win.destroy()
+
+
+# ---------- 修改密码 / 修改密保（设置面板内入口） ----------
+class ChangePasswordWindow:
+    """在设置面板内修改密码：需先输入旧密码"""
+    MIN_PASSWORD_LEN = SecuritySetupWindow.MIN_PASSWORD_LEN
+
+    def __init__(self, master, app):
+        self.app = app
+        self.win = tk.Toplevel(master)
+        self.win.title("修改密码")
+        self.win.resizable(False, False)
+        self.win.grab_set()
+        self.win.transient(master)
+
+        ttk.Label(self.win, text="修改登录密码", font=("", 10, "bold")).grid(
+            row=0, column=0, columnspan=2, padx=20, pady=(10, 6))
+
+        ttk.Label(self.win, text="当前密码:").grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        self.old_var = tk.StringVar()
+        ttk.Entry(self.win, textvariable=self.old_var, show="*", width=22).grid(
+            row=1, column=1, padx=10, pady=4)
+
+        ttk.Label(self.win, text=f"新密码（至少 {self.MIN_PASSWORD_LEN} 位）:").grid(
+            row=2, column=0, sticky="w", padx=10, pady=4)
+        self.new_var = tk.StringVar()
+        ttk.Entry(self.win, textvariable=self.new_var, show="*", width=22).grid(
+            row=2, column=1, padx=10, pady=4)
+
+        ttk.Label(self.win, text="确认新密码:").grid(row=3, column=0, sticky="w", padx=10, pady=4)
+        self.new2_var = tk.StringVar()
+        ttk.Entry(self.win, textvariable=self.new2_var, show="*", width=22).grid(
+            row=3, column=1, padx=10, pady=4)
+
+        self.err_var = tk.StringVar(value="")
+        ttk.Label(self.win, textvariable=self.err_var, foreground="red").grid(
+            row=4, column=0, columnspan=2, padx=10, pady=(2, 4))
+
+        btn_frame = ttk.Frame(self.win)
+        btn_frame.grid(row=5, column=0, columnspan=2, pady=8)
+        ttk.Button(btn_frame, text="保存", command=self.save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.win.destroy).pack(side=tk.LEFT, padx=5)
+
+    def save(self):
+        sec = self.app.config.get("security", {})
+        if not verify_secret(self.old_var.get(), sec.get("password_salt", ""), sec.get("password_hash", "")):
+            self.err_var.set("当前密码错误")
+            return
+        new = self.new_var.get()
+        if len(new) < self.MIN_PASSWORD_LEN:
+            self.err_var.set(f"新密码长度不能少于 {self.MIN_PASSWORD_LEN} 位")
+            return
+        if new != self.new2_var.get():
+            self.err_var.set("两次输入的新密码不一致")
+            return
+        salt, h = hash_secret(new)
+        sec["password_salt"] = salt
+        sec["password_hash"] = h
+        self.app.config["security"] = sec
+        save_config(self.app.config)
+        try:
+            self.app.logger.info("登录密码已修改")
+        except Exception:
+            pass
+        messagebox.showinfo("完成", "密码已修改", parent=self.win)
+        self.win.destroy()
+
+
+class ChangeQAWindow:
+    """在设置面板内修改密保问题：需先校验当前密码"""
+    QA_COUNT = SecuritySetupWindow.QA_COUNT
+
+    def __init__(self, master, app):
+        self.app = app
+        self.win = tk.Toplevel(master)
+        self.win.title("修改密保问题")
+        self.win.resizable(False, False)
+        self.win.grab_set()
+        self.win.transient(master)
+
+        ttk.Label(self.win, text=f"修改密保问题（{self.QA_COUNT} 个）", font=("", 10, "bold")).grid(
+            row=0, column=0, columnspan=4, padx=10, pady=(10, 6))
+
+        ttk.Label(self.win, text="请先输入当前密码:").grid(row=1, column=0, sticky="w", padx=5, pady=4)
+        self.pwd_var = tk.StringVar()
+        ttk.Entry(self.win, textvariable=self.pwd_var, show="*", width=20).grid(
+            row=1, column=1, padx=5, pady=4)
+
+        # 复用现有密保问题为默认值
+        existing_qa = app.config.get("security", {}).get("qa", [])
+        default_questions = (
+            [item.get("question", SECURITY_QUESTIONS[i]) for i, item in enumerate(existing_qa)]
+            + SECURITY_QUESTIONS
+        )[: max(self.QA_COUNT, len(existing_qa))]
+
+        self.q_vars = []
+        for i in range(self.QA_COUNT):
+            ttk.Label(self.win, text=f"问题 {i + 1}:").grid(row=2 + i, column=0, sticky="w", padx=5, pady=2)
+            q_var = tk.StringVar(value=default_questions[i] if i < len(default_questions) else SECURITY_QUESTIONS[i])
+            ttk.Combobox(self.win, textvariable=q_var, values=SECURITY_QUESTIONS,
+                         width=30, state="normal").grid(row=2 + i, column=1, padx=5, pady=2)
+            ttk.Label(self.win, text="新答案:").grid(row=2 + i, column=2, sticky="w", padx=5, pady=2)
+            a_var = tk.StringVar()
+            ttk.Entry(self.win, textvariable=a_var, show="*", width=20).grid(row=2 + i, column=3, padx=5, pady=2)
+            self.q_vars.append((q_var, a_var))
+
+        self.err_var = tk.StringVar(value="")
+        ttk.Label(self.win, textvariable=self.err_var, foreground="red").grid(
+            row=2 + self.QA_COUNT, column=0, columnspan=4, padx=5, pady=(2, 4))
+
+        btn_frame = ttk.Frame(self.win)
+        btn_frame.grid(row=3 + self.QA_COUNT, column=0, columnspan=4, pady=8)
+        ttk.Button(btn_frame, text="保存", command=self.save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.win.destroy).pack(side=tk.LEFT, padx=5)
+
+    def save(self):
+        sec = self.app.config.get("security", {})
+        if not verify_secret(self.pwd_var.get(), sec.get("password_salt", ""), sec.get("password_hash", "")):
+            self.err_var.set("当前密码错误")
+            return
+        qa = []
+        for i, (q_var, a_var) in enumerate(self.q_vars):
+            q = q_var.get().strip()
+            a = a_var.get()
+            if not q:
+                self.err_var.set(f"第 {i + 1} 个问题不能为空")
+                return
+            if not a.strip():
+                self.err_var.set(f"第 {i + 1} 个答案不能为空")
+                return
+            salt, h = hash_secret(normalize_answer(a))
+            qa.append({"question": q, "answer_hash": h, "answer_salt": salt})
+        sec["qa"] = qa
+        self.app.config["security"] = sec
+        save_config(self.app.config)
+        try:
+            self.app.logger.info("密保问题已更新")
+        except Exception:
+            pass
+        messagebox.showinfo("完成", "密保问题已更新", parent=self.win)
+        self.win.destroy()
+
 
 # ---------- 设置窗口 ----------
 class SettingsWindow:
@@ -507,6 +1026,8 @@ class SettingsWindow:
         btn_frame = ttk.Frame(self.win)
         btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
         ttk.Button(btn_frame, text="保存并隐藏", command=self.save_and_hide).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="修改密码", command=self.change_password).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="修改密保", command=self.change_qa).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="退出程序", command=self.app.quit_app).pack(side=tk.LEFT, padx=5)
 
         self.win.grab_set()
@@ -574,6 +1095,12 @@ class SettingsWindow:
 
     def on_close(self):
         self.win.destroy()
+
+    def change_password(self):
+        ChangePasswordWindow(self.win, self.app)
+
+    def change_qa(self):
+        ChangeQAWindow(self.win, self.app)
 
 if __name__ == "__main__":
     app = UCopyApp()
