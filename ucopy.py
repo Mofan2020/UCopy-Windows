@@ -567,7 +567,6 @@ class SecuritySetupWindow:
         ttk.Button(btn_frame, text="保存并进入设置", command=self.save).pack(side=tk.LEFT, padx=5)
 
         self.win.grab_set()
-        self.win.transient(master)
 
     def _block_close(self):
         messagebox.showwarning("必须设置", "请先完成密码与密保设置，才能使用本程序。", parent=self.win)
@@ -650,7 +649,6 @@ class LoginWindow:
 
         self.win.bind("<Return>", lambda e: self.verify())
         self.win.grab_set()
-        self.win.transient(master)
 
     def cancel_and_quit(self):
         """取消登录：直接退出整个应用（密码保护下不应让用户绕过）"""
@@ -735,7 +733,6 @@ class ForgotPasswordWindow:
         self.win.title("找回密码")
         self.win.resizable(False, False)
         self.win.grab_set()
-        self.win.transient(master)
 
         ttk.Label(
             self.win,
@@ -794,7 +791,6 @@ class ResetPasswordWindow:
         self.win.title("重置密码")
         self.win.resizable(False, False)
         self.win.grab_set()
-        self.win.transient(master)
 
         ttk.Label(self.win, text="密保校验通过，请设置新密码",
                   font=("", 10)).grid(row=0, column=0, columnspan=2, padx=20, pady=(12, 6))
@@ -854,7 +850,6 @@ class ChangePasswordWindow:
         self.win.title("修改密码")
         self.win.resizable(False, False)
         self.win.grab_set()
-        self.win.transient(master)
 
         ttk.Label(self.win, text="修改登录密码", font=("", 10, "bold")).grid(
             row=0, column=0, columnspan=2, padx=20, pady=(10, 6))
@@ -919,7 +914,6 @@ class ChangeQAWindow:
         self.win.title("修改密保问题")
         self.win.resizable(False, False)
         self.win.grab_set()
-        self.win.transient(master)
 
         ttk.Label(self.win, text=f"修改密保问题（{self.QA_COUNT} 个）", font=("", 10, "bold")).grid(
             row=0, column=0, columnspan=4, padx=10, pady=(10, 6))
