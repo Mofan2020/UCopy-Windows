@@ -1095,7 +1095,12 @@ class SettingsWindow:
             for handler in new_logger.handlers:
                 self.app.logger.addHandler(handler)
 
+        # 保留 self.app.config 中 UI 未编辑的字段（security、known_devices 等），
+        # 仅覆盖当前面板上修改过的字段。
+        # 注意：以前这里显式列字段，结果漏掉了 security，每次"保存并隐藏"
+        # 都会把磁盘上的密码/密保擦成默认值，导致重启后又要重设。
         cfg = {
+            **self.app.config,
             "target_folder": target,
             "max_total_files": self.max_files_var.get(),
             "max_total_size_mb": self.max_size_var.get(),
@@ -1104,7 +1109,6 @@ class SettingsWindow:
             "extensions": self.ext_var.get().strip(),
             "regex_pattern": self.regex_var.get().strip(),
             "auto_start": self.auto_var.get(),
-            "known_devices": self.app.config.get("known_devices", {})
         }
         save_config(cfg)
         self.app.config = cfg
