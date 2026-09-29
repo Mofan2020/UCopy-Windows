@@ -3,7 +3,20 @@ name: Build Windows EXE
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:   # 允许手动触发
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本号，例如 v1.3.0（留空则只构建不发版）'
+        required: false
+        type: string
+      release_notes:
+        description: 'Release 说明（留空则用自动生成的）'
+        required: false
+        type: string
+
+permissions:
+  contents: write   # 创建 Release 需要
 
 jobs:
   build:
@@ -31,3 +44,25 @@ jobs:
         with:
           name: UCopy-exe
           path: dist/UCopy.exe
+
+      # ---------- 推 tag 时自动发 Release ----------
+      - name: Publish release (tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" "dist/UCopy.exe#UCopy.exe" --title "UCopy for Windows - $TAG" --generate-notes
+
+      # ---------- 手动触发并指定版本号时发 Release ----------
+      - name: Publish release (manual)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          NOTES: ${{ inputs.release_notes }}
+        run: |
+          if [ -z "$NOTES" ]; then
+            NOTES=$(gh api "repos/${{ github.repository }}/releases/generate-notes" -f tag_name="$VERSION" --jq .body)
+          fi
+          gh release create "$VERSION" "dist/UCopy.exe#UCopy.exe" \
+            --title "UCopy for Windows - $VERSION" --notes "$NOTES"
