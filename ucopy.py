@@ -509,8 +509,8 @@ class FloatingDot:
     屏幕右上角常驻的紫色小圆点，替代原来的系统托盘图标。
     无边框、置顶、背景色抠除做透明，双击打开设置面板。
     """
-    SIZE = 10          # 小圆点直径（像素），按用户要求不超过 10px
-    HIT = 26           # 透明点击区域边长，让 10px 的点也容易双击命中
+    SIZE = 8           # 小圆点直径（像素）
+    HIT = 24           # 透明点击区域边长，让 8px 的点也容易双击命中
     MARGIN = 12        # 距屏幕右边缘 / 上边缘的像素
     DOT_COLOR = "#8B5CF6"
     TRANSPARENT_KEY = "#0A0B0C"   # 魔术色，与紫色差异大，用作透明键
@@ -537,14 +537,17 @@ class FloatingDot:
             highlightthickness=0, bd=0, padx=0, pady=0
         )
         self.label.pack()
-        for w in (self.label, self.win):
-            w.bind("<Double-Button-1>", self._activate)
-            w.bind("<Double-Button-2>", self._activate)
+        # 只在顶层窗口上绑定：若 label 和 toplevel 都绑，
+        # 一次双击会因 Tk 的 bindtag 传播被派发两次，导致开出两个窗口
+        self.win.bind("<Double-Button-1>", self._activate)
+        self.win.bind("<Double-Button-2>", self._activate)
 
         self.place_top_right()
 
     def _activate(self, event=None):
+        # 返回 "break" 阻止事件继续沿 bindtag 传播，杜绝重复触发
         self.on_activate()
+        return "break"
 
     def place_top_right(self):
         self.win.update_idletasks()
@@ -567,6 +570,7 @@ class UCopyApp:
         self.floating_dot = None
         self.panel_open = False   # 设置面板/登录窗是否已打开（防重复创建）
         self.panel_win = None
+        self._last_open_ts = 0.0  # 打开设置面板的防抖时间戳
         self.job_lock = threading.Lock()
         self.current_jobs = {}
 
@@ -650,8 +654,16 @@ class UCopyApp:
           - 若未设置过密码，强制进入 SecuritySetupWindow
           - 若已设置，弹 LoginWindow 校验密码
           - 校验通过后回调进入 SettingsWindow
+
+        注意：面板占用标记从“弹登录窗”这一刻就置位（不是等到 SettingsWindow），
+        否则登录窗阶段 panel_open 仍为 False，一次双击会开出两个密码窗。
         """
-        # 面板已经是模态（grab_set），再开一个会导致两个窗口抢 grab
+        now = time.time()
+        # 双击事件可能因 Tk 的 bindtag 传播被派发多次，这里做 1 秒防抖兜底
+        if now - self._last_open_ts < 1.0:
+            return
+        self._last_open_ts = now
+
         if self.panel_open:
             existing = self.panel_win
             try:
@@ -668,11 +680,15 @@ class UCopyApp:
             self.panel_open = True
             SettingsWindow(self.root, self, on_close=self._close_panel)
 
+        # 立刻占位：登录窗 / 首次设置窗期间也禁止重复创建
+        self.panel_open = True
         sec = self.config.get("security", {})
         if not sec.get("password_hash"):
-            SecuritySetupWindow(self.root, self, on_success=_open_settings)
+            SecuritySetupWindow(self.root, self, on_success=_open_settings,
+                                on_close=self._close_panel)
         else:
-            LoginWindow(self.root, self, on_success=_open_settings)
+            LoginWindow(self.root, self, on_success=_open_settings,
+                        on_close=self._close_panel)
 
     def _close_panel(self):
         self.panel_open = False
@@ -705,9 +721,10 @@ class SecuritySetupWindow:
     MIN_PASSWORD_LEN = 4
     QA_COUNT = 3
 
-    def __init__(self, master, app, on_success):
+    def __init__(self, master, app, on_success, on_close=None):
         self.app = app
         self.on_success = on_success  # 回调：完成设置后进入 SettingsWindow
+        self.on_close = on_close      # 回调：窗口关闭时释放面板占用标记
         self.win = tk.Toplevel(master)
         self.win.title("UCopy 安全设置")
         self.win.resizable(False, False)
@@ -800,6 +817,8 @@ class SecuritySetupWindow:
         except Exception:
             pass
         self.win.destroy()
+        if self.on_close:
+            self.on_close()
         if self.on_success:
             self.on_success()
 
@@ -812,9 +831,10 @@ class LoginWindow:
     """
     MAX_ATTEMPTS = 5  # 失败超过次数强制退出
 
-    def __init__(self, master, app, on_success):
+    def __init__(self, master, app, on_success, on_close=None):
         self.app = app
         self.on_success = on_success
+        self.on_close = on_close      # 回调：窗口关闭时释放面板占用标记
         self.attempts = 0
         self._locked = False  # 触顶后置 True，幂等保护
         self.win = tk.Toplevel(master)
@@ -843,6 +863,19 @@ class LoginWindow:
         self.win.bind("<Return>", lambda e: self.verify())
         self.win.grab_set()
 
+    def _close(self):
+        """统一的窗口关闭：释放 grab、销毁窗口、释放面板占用标记"""
+        try:
+            self.win.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        if self.on_close:
+            self.on_close()
+
     def cancel(self):
         """
         取消登录：只关闭密码窗口，程序与后台 U 盘复制继续运行。
@@ -852,11 +885,7 @@ class LoginWindow:
             self.app.logger.info("用户取消密码输入，关闭登录窗口")
         except Exception:
             pass
-        try:
-            self.win.grab_release()
-        except tk.TclError:
-            pass
-        self.win.destroy()
+        self._close()
 
     def verify(self):
         if self._locked:
@@ -869,7 +898,7 @@ class LoginWindow:
                 self.app.logger.info("设置面板密码验证通过")
             except Exception:
                 pass
-            self.win.destroy()
+            self._close()
             if self.on_success:
                 self.on_success()
             return
@@ -893,7 +922,7 @@ class LoginWindow:
             except Exception:
                 pass
             self._locked = True
-            self.win.destroy()
+            self._close()
             messagebox.showerror(
                 "已临时锁定",
                 f"密码连续 {self.MAX_ATTEMPTS} 次错误，已关闭设置面板。\n"
@@ -918,11 +947,10 @@ class LoginWindow:
         ForgotPasswordWindow(self.win, self.app, qa, on_reset=self._on_reset_done)
 
     def _on_reset_done(self):
-        """密保校验通过、重置密码后，回到登录窗口（让用户用新密码再登一次）"""
-        # 直接进入设置
+        """密保校验通过、重置密码后：关掉（已隐藏的）登录窗并直接进入设置"""
+        self._close()
         if self.on_success:
             self.on_success()
-        self.win.destroy()
 
 
 class ForgotPasswordWindow:
