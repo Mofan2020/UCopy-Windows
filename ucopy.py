@@ -9,6 +9,7 @@ import datetime
 import threading
 import logging
 import logging.handlers
+from copy import deepcopy
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -18,8 +19,6 @@ import win32file
 import win32gui
 import win32gui_struct
 import pythoncom
-import pystray
-from PIL import Image, ImageDraw
 
 # ---------- 全局配置 ----------
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ucopy_settings.json")
@@ -45,6 +44,12 @@ DEFAULT_CONFIG = {
     "extensions": "",
     "regex_pattern": "",
     "auto_start": False,
+    # 名单模式二选一：
+    #   "blacklist"  黑名单模式 —— 只有在名单里的 U 盘才跳过复制
+    #   "whitelist"  白名单模式 —— 只有在名单里的 U 盘才复制
+    "device_list_mode": "blacklist",
+    # known_devices[uid] = {"label": str, "first_seen": str, "listed": bool}
+    # "listed" 的含义随模式变化：黑名单下 true=拉黑，白名单下 true=放行
     "known_devices": {},
     "security": {
         "password_hash": "",
@@ -52,6 +57,29 @@ DEFAULT_CONFIG = {
         "qa": []  # [{"question": str, "answer_hash": str, "answer_salt": str}, ...]
     }
 }
+
+# ---------- 名单模式（黑名单 / 白名单，二选一）----------
+LIST_MODE_LABELS = {
+    "blacklist": "黑名单模式",
+    "whitelist": "白名单模式",
+}
+
+def normalize_list_mode(mode):
+    """把任意输入收敛成合法的名单模式，非白名单一律按黑名单处理。"""
+    return "whitelist" if mode == "whitelist" else "blacklist"
+
+def list_mode_noun(mode):
+    """当前模式下，把"被列入名单"称作什么（黑/白）。"""
+    return "白名单" if normalize_list_mode(mode) == "whitelist" else "黑名单"
+
+def is_device_allowed(info, mode):
+    """
+    判断设备在当前模式下是否允许复制。
+    blacklist: 不在黑名单里 -> 允许
+    whitelist: 在白名单里   -> 允许
+    """
+    listed = bool(info.get("listed", False))
+    return listed if normalize_list_mode(mode) == "whitelist" else not listed
 
 # ---------- 密码 / 密保答案哈希 ----------
 def hash_secret(secret: str, salt: str = None):
@@ -77,7 +105,7 @@ def normalize_answer(answer: str) -> str:
 
 def get_config():
     if not os.path.exists(CONFIG_PATH):
-        return DEFAULT_CONFIG.copy()
+        return deepcopy(DEFAULT_CONFIG)
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
@@ -93,13 +121,45 @@ def get_config():
                 sec[k] = v if not isinstance(v, (dict, list)) else (
                     {**v} if isinstance(v, dict) else list(v)
                 )
+        # 名单模式归一化
+        cfg["device_list_mode"] = normalize_list_mode(cfg.get("device_list_mode"))
+        # 旧版本用 blacklisted 字段表示"在黑名单里"，迁移成通用的 listed。
+        # 迁移必须结合当前模式：白名单模式下 listed 的含义与 blacklisted 相反。
+        mode = cfg["device_list_mode"]
+        for info in cfg.get("known_devices", {}).values():
+            if "listed" not in info and "blacklisted" in info:
+                was_blacklisted = bool(info["blacklisted"])
+                info["listed"] = (not was_blacklisted) if mode == "whitelist" else was_blacklisted
+        for info in cfg.get("known_devices", {}).values():
+            info.pop("blacklisted", None)
         return cfg
-    except:
-        return DEFAULT_CONFIG.copy()
+    except Exception as e:
+        # 以前这里是无声 except，读失败就回退默认值——用户配置被悄悄清空，
+        # 且没有任何线索可查。至少留一条日志。
+        try:
+            logging.getLogger("UCopy").error(f"读取配置失败，已回退默认配置: {e}")
+        except Exception:
+            pass
+        return deepcopy(DEFAULT_CONFIG)
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    """
+    原子写入配置文件：先写临时文件再改名，避免中途崩溃/断电留下半截 JSON。
+    半截 JSON 会让 get_config 解析失败，进而把用户的密码、设备名单全部回退成默认值。
+    """
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
+    except Exception as e:
+        try:
+            logging.getLogger("UCopy").error(f"保存配置失败: {e}")
+        except Exception:
+            pass
+        raise
 
 def set_auto_start(enable):
     key = win32api.RegOpenKey(
@@ -384,13 +444,77 @@ class DeviceMonitor:
         if self.thread:
             self.thread.join(timeout=2)
 
+# ---------- 桌面悬浮小圆点 ----------
+class FloatingDot:
+    """
+    屏幕右上角常驻的紫色小圆点，替代原来的系统托盘图标。
+    无边框、置顶、背景色抠除做透明，双击打开设置面板。
+    """
+    SIZE = 22
+    MARGIN = 16          # 距屏幕右边缘 / 上边缘的像素
+    DOT_COLOR = "#8B5CF6"
+    TRANSPARENT_KEY = "#0A0B0C"   # 魔术色，与紫色差异大，用作透明键
+
+    def __init__(self, master, on_activate):
+        self.on_activate = on_activate
+        self.win = tk.Toplevel(master)
+        self.win.overrideredirect(True)
+        self.win.title("UCopy")
+        try:
+            self.win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        try:
+            # Windows 下用指定色做完全透明
+            self.win.attributes("-transparentcolor", self.TRANSPARENT_KEY)
+        except tk.TclError:
+            pass
+
+        self.canvas = tk.Canvas(
+            self.win, width=self.SIZE, height=self.SIZE,
+            bg=self.TRANSPARENT_KEY, highlightthickness=0, bd=0
+        )
+        pad = 2
+        self.canvas.create_oval(
+            pad, pad, self.SIZE - pad, self.SIZE - pad,
+            fill=self.DOT_COLOR, outline=""
+        )
+        self.canvas.pack()
+        for w in (self.canvas, self.win):
+            w.bind("<Double-Button-1>", self._activate)
+            w.bind("<Double-Button-2>", self._activate)
+        # 短暂禁用双击间隔，方便快速双击
+        try:
+            self.canvas.configure(doubleclicktime=300)
+        except tk.TclError:
+            pass
+
+        self.place_top_right()
+
+    def _activate(self, event=None):
+        self.on_activate()
+
+    def place_top_right(self):
+        self.win.update_idletasks()
+        sw = self.win.winfo_screenwidth()
+        x = max(0, sw - self.SIZE - self.MARGIN)
+        self.win.geometry(f"{self.SIZE}x{self.SIZE}+{x}+{self.MARGIN}")
+
+    def destroy(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
 # ---------- 主应用 ----------
 class UCopyApp:
     def __init__(self):
         self.config = get_config()
         self.logger = None
         self.monitor = None
-        self.tray_icon = None
+        self.floating_dot = None
+        self.panel_open = False   # 设置面板/登录窗是否已打开（防重复创建）
+        self.panel_win = None
         self.job_lock = threading.Lock()
         self.current_jobs = {}
 
@@ -415,12 +539,15 @@ class UCopyApp:
         self.logger.info(f"U盘信息: 卷标={label}, 唯一ID={unique_id}")
 
         # 更新已知设备列表
+        mode = normalize_list_mode(self.config.get("device_list_mode"))
         known = self.config.setdefault("known_devices", {})
         if unique_id not in known:
             known[unique_id] = {
                 "label": label,
                 "first_seen": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "blacklisted": False
+                # 白名单模式下新设备默认不在名单里（不会被复制）；
+                # 黑名单模式下默认不在名单里（会被复制），保持历史行为。
+                "listed": False
             }
             self.logger.info(f"新设备已记录: {label} ({unique_id})")
             save_config(self.config)
@@ -429,9 +556,10 @@ class UCopyApp:
             known[unique_id]["label"] = label
             save_config(self.config)
 
-        # 检查黑名单
-        if known[unique_id].get("blacklisted", False):
-            self.logger.info(f"U盘 {label} 在黑名单中，跳过复制")
+        # 按当前名单模式决定是否复制
+        if not is_device_allowed(known[unique_id], mode):
+            verb = "不在白名单中，不复制" if mode == "whitelist" else "在黑名单中，跳过复制"
+            self.logger.info(f"U盘 {label} {verb}")
             return
 
         # 启动复制线程
@@ -459,25 +587,34 @@ class UCopyApp:
             self.monitor.stop()
             self.monitor = None
 
-    def create_tray_icon(self):
-        image = Image.new('RGB', (64, 64), color='white')
-        dc = ImageDraw.Draw(image)
-        dc.rectangle([16, 16, 48, 48], fill='blue')
-        menu = pystray.Menu(
-            pystray.MenuItem("打开设置", self.show_settings),
-            pystray.MenuItem("退出", self.quit_app)
-        )
-        self.tray_icon = pystray.Icon("UCopy", image, "UCopy", menu)
+    def create_floating_dot(self):
+        """在屏幕右上角放一个置顶的紫色小圆点，双击打开设置面板。"""
+        self.floating_dot = FloatingDot(self.root, on_activate=self.show_settings)
 
-    def show_settings(self, icon=None, item=None):
+    def show_settings(self, event=None):
         """
-        打开设置面板的统一入口：
+        打开设置面板的统一入口（小圆点双击触发）：
+          - 若已有面板/登录窗在开，直接前置，不重复创建
           - 若未设置过密码，强制进入 SecuritySetupWindow
           - 若已设置，弹 LoginWindow 校验密码
           - 校验通过后回调进入 SettingsWindow
         """
+        # 面板已经是模态（grab_set），再开一个会导致两个窗口抢 grab
+        if self.panel_open:
+            existing = self.panel_win
+            try:
+                if existing is not None and existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+            self.panel_open = False
+
         def _open_settings():
-            SettingsWindow(self.root, self)
+            self.panel_open = True
+            SettingsWindow(self.root, self, on_close=self._close_panel)
 
         sec = self.config.get("security", {})
         if not sec.get("password_hash"):
@@ -485,22 +622,26 @@ class UCopyApp:
         else:
             LoginWindow(self.root, self, on_success=_open_settings)
 
+    def _close_panel(self):
+        self.panel_open = False
+        self.panel_win = None
+
     def quit_app(self, icon=None, item=None):
         self.logger.info("用户请求退出程序")
         self.stop_monitor()
-        if self.tray_icon:
-            self.tray_icon.stop()
+        if self.floating_dot:
+            self.floating_dot.destroy()
         self.root.quit()
         self.root.destroy()
         sys.exit(0)
 
     def run(self):
         self.init_logger()
-        self.create_tray_icon()
+        self.create_floating_dot()
         self.start_monitor()
-        tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
-        tray_thread.start()
-        self.root.after(500, self.show_settings)
+        # 首次启动引导设置密码；已有密码则不打扰，双击小圆点即可打开面板
+        if not self.config.get("security", {}).get("password_hash"):
+            self.root.after(500, self.show_settings)
         self.root.mainloop()
 
 # ---------- 密码设置窗口（首次强制） ----------
@@ -681,7 +822,7 @@ class LoginWindow:
             pass
         if left <= 0:
             # 达到上限：仅关闭密码窗口，程序与后台 U 盘复制继续运行，
-            # 留下审计日志供事后追溯。需要再试可从托盘重新打开设置。
+            # 留下审计日志供事后追溯。需要再试可再次双击右上角小圆点。
             try:
                 self.app.logger.warning(
                     f"设置面板密码连续 {self.MAX_ATTEMPTS} 次错误，临时锁定，"
@@ -694,7 +835,7 @@ class LoginWindow:
             messagebox.showerror(
                 "已临时锁定",
                 f"密码连续 {self.MAX_ATTEMPTS} 次错误，已关闭设置面板。\n"
-                "后台 U 盘复制功能继续运行，需要时可从托盘菜单重新打开设置。",
+                "后台 U 盘复制功能继续运行，需要时可再次双击右上角小圆点。",
                 parent=self.app.root,
             )
             return
@@ -980,12 +1121,14 @@ class ChangeQAWindow:
 
 # ---------- 设置窗口 ----------
 class SettingsWindow:
-    def __init__(self, master, app):
+    def __init__(self, master, app, on_close=None):
         self.app = app
+        self.on_close_cb = on_close
         self.win = tk.Toplevel(master)
         self.win.title("UCopy 设置")
         self.win.resizable(False, False)
         self.win.protocol("WM_DELETE_WINDOW", self.on_close)
+        app.panel_win = self.win
 
         cfg = app.config
 
@@ -1025,31 +1168,60 @@ class SettingsWindow:
         self.auto_var = tk.BooleanVar(value=cfg["auto_start"])
         ttk.Checkbutton(frame_basic, text="开机自动启动", variable=self.auto_var).grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
-        # 黑名单管理
-        frame_black = ttk.LabelFrame(self.win, text="已识别U盘 (勾选后不再复制)", padding=5)
-        frame_black.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
+        # ---- 名单模式（黑名单 / 白名单，二选一）----
+        frame_list = ttk.LabelFrame(self.win, text="U盘名单", padding=5)
+        frame_list.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
 
-        self.device_listbox = tk.Listbox(frame_black, width=60, height=6, selectmode=tk.MULTIPLE)
-        self.device_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(frame_black, orient=tk.VERTICAL, command=self.device_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.list_mode_var = tk.StringVar(
+            value=normalize_list_mode(cfg.get("device_list_mode"))
+        )
+        ttk.Label(frame_list, text="工作模式:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self.mode_combo = ttk.Combobox(
+            frame_list, textvariable=self.list_mode_var,
+            values=["blacklist", "whitelist"], state="readonly", width=12
+        )
+        self.mode_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        self.mode_combo.bind("<<ComboboxSelected>>", self.on_mode_changed)
+        self.mode_hint_var = tk.StringVar()
+        ttk.Label(frame_list, textvariable=self.mode_hint_var, foreground="gray").grid(
+            row=0, column=2, sticky="w", padx=8
+        )
+
+        self.device_listbox = tk.Listbox(frame_list, width=60, height=6, selectmode=tk.MULTIPLE)
+        self.device_listbox.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
+        scrollbar = ttk.Scrollbar(frame_list, orient=tk.VERTICAL, command=self.device_listbox.yview)
+        scrollbar.grid(row=1, column=3, sticky="ns", padx=(0, 5))
         self.device_listbox.config(yscrollcommand=scrollbar.set)
 
-        self.refresh_device_list()
+        btn_frame_black = ttk.Frame(frame_list)
+        btn_frame_black.grid(row=2, column=0, columnspan=4, pady=(2, 0))
+        self.toggle_btn = ttk.Button(btn_frame_black, command=self.toggle_listed)
+        self.toggle_btn.pack(side=tk.LEFT, padx=5)
 
-        btn_frame_black = ttk.Frame(self.win)
-        btn_frame_black.grid(row=2, column=0, columnspan=2, pady=5)
-        ttk.Button(btn_frame_black, text="切换黑名单状态", command=self.toggle_blacklist).pack(side=tk.LEFT, padx=5)
+        self.on_mode_changed()   # 初始化按钮文字与提示
 
         # 底部按钮
         btn_frame = ttk.Frame(self.win)
-        btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
         ttk.Button(btn_frame, text="保存并隐藏", command=self.save_and_hide).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="修改密码", command=self.change_password).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="修改密保", command=self.change_qa).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="退出程序", command=self.app.quit_app).pack(side=tk.LEFT, padx=5)
 
         self.win.grab_set()
+
+    def on_mode_changed(self, event=None):
+        """切换黑/白名单模式时，同步刷新按钮文字、列表状态标记和说明。"""
+        mode = normalize_list_mode(self.list_mode_var.get())
+        noun = list_mode_noun(mode)
+        if mode == "blacklist":
+            hint = "黑名单：名单内的 U 盘不复制，其余都复制"
+            self.toggle_btn.config(text="加入/移出黑名单")
+        else:
+            hint = "白名单：只有名单内的 U 盘才复制，其余都不复制"
+            self.toggle_btn.config(text="加入/移出白名单")
+        self.mode_hint_var.set(hint)
+        self.refresh_device_list()
 
     def browse_target(self):
         folder = filedialog.askdirectory(parent=self.win)
@@ -1058,26 +1230,36 @@ class SettingsWindow:
 
     def refresh_device_list(self):
         self.device_listbox.delete(0, tk.END)
+        mode = normalize_list_mode(self.list_mode_var.get())
+        noun = list_mode_noun(mode)
         known = self.app.config.get("known_devices", {})
         for uid, info in known.items():
             label = info.get("label", "?")
-            black = info.get("blacklisted", False)
-            display = f"{label}  [{uid}]  {'[黑名单]' if black else '[正常]'}"
-            self.device_listbox.insert(tk.END, display)
+            listed = bool(info.get("listed", False))
+            if listed:
+                tag = f"[在{noun}中]"
+            else:
+                tag = "[会复制]" if mode == "blacklist" else "[不复制]"
+            self.device_listbox.insert(tk.END, f"{label}  [{uid}]  {tag}")
 
-    def toggle_blacklist(self):
+    def toggle_listed(self):
         selected = self.device_listbox.curselection()
         if not selected:
-            messagebox.showinfo("提示", "请先选择U盘")
+            messagebox.showinfo("提示", "请先选择U盘", parent=self.win)
             return
         known = self.app.config.get("known_devices", {})
         items = list(known.items())
         for idx in selected:
             if idx < len(items):
                 uid, info = items[idx]
-                info["blacklisted"] = not info.get("blacklisted", False)
+                info["listed"] = not bool(info.get("listed", False))
+        self.app.config["device_list_mode"] = normalize_list_mode(self.list_mode_var.get())
         save_config(self.app.config)
         self.refresh_device_list()
+
+    def toggle_blacklist(self):
+        """旧方法名，保留为 toggle_listed 的别名以兼容外部调用。"""
+        return self.toggle_listed()
 
     def save_and_hide(self):
         target = self.target_var.get().strip()
@@ -1109,15 +1291,21 @@ class SettingsWindow:
             "extensions": self.ext_var.get().strip(),
             "regex_pattern": self.regex_var.get().strip(),
             "auto_start": self.auto_var.get(),
+            "device_list_mode": normalize_list_mode(self.list_mode_var.get()),
         }
         save_config(cfg)
         self.app.config = cfg
         set_auto_start(cfg["auto_start"])
-        self.app.logger.info("设置已保存")
-        self.win.destroy()
+        mode = cfg["device_list_mode"]
+        self.app.logger.info(f"设置已保存（{LIST_MODE_LABELS[mode]}）")
+        self.on_close()
 
     def on_close(self):
-        self.win.destroy()
+        try:
+            self.win.destroy()
+        finally:
+            if self.on_close_cb:
+                self.on_close_cb()
 
     def change_password(self):
         ChangePasswordWindow(self.win, self.app)
