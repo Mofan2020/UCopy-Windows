@@ -9,6 +9,9 @@ import datetime
 import threading
 import logging
 import logging.handlers
+import zlib
+import struct
+import base64
 from copy import deepcopy
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -445,13 +448,70 @@ class DeviceMonitor:
             self.thread.join(timeout=2)
 
 # ---------- 桌面悬浮小圆点 ----------
+def _hex_to_rgb(color):
+    c = color.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _blend(c1, c2, ratio):
+    """按 ratio(0~1) 把 c1 混向 c2"""
+    return tuple(int(round(a + (b - a) * ratio)) for a, b in zip(c1, c2))
+
+
+def build_dot_png(win_px, diameter, color, key, supersample=8):
+    """
+    生成一张 win_px x win_px 的 PNG：中央为 diameter 像素的圆，
+    圆边缘做 supersample 抗锯齿处理，并把半透明像素预先混向透明键色。
+
+    这样即使 Tk 不支持带 alpha 的图片，边缘也不会出现锯齿或黑边。
+    """
+    fg = _hex_to_rgb(color)
+    bg = _hex_to_rgb(key)
+    r = diameter / 2.0
+    cx = cy = win_px / 2.0
+    ss = max(1, int(supersample))
+    rows = []
+    for y in range(win_px):
+        row = bytearray()
+        for x in range(win_px):
+            inside = 0
+            for sy in range(ss):
+                py = y + (sy + 0.5) / ss
+                for sx in range(ss):
+                    px = x + (sx + 0.5) / ss
+                    if (px - cx) ** 2 + (py - cy) ** 2 <= r * r:
+                        inside += 1
+            cover = inside / float(ss * ss)
+            if cover <= 0:
+                rgb = bg
+            elif cover >= 1:
+                rgb = fg
+            else:
+                rgb = _blend(bg, fg, cover)
+            row += bytes(rgb)
+        rows.append(bytes(row))
+
+    raw = b"".join(b"\x00" + row for row in rows)  # 每行前缀 0 = 无 PNG filter
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", win_px, win_px, 8, 2, 0, 0, 0)  # 8bit truecolor RGB
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
+
+
 class FloatingDot:
     """
     屏幕右上角常驻的紫色小圆点，替代原来的系统托盘图标。
     无边框、置顶、背景色抠除做透明，双击打开设置面板。
     """
-    SIZE = 22
-    MARGIN = 16          # 距屏幕右边缘 / 上边缘的像素
+    SIZE = 10          # 小圆点直径（像素），按用户要求不超过 10px
+    HIT = 26           # 透明点击区域边长，让 10px 的点也容易双击命中
+    MARGIN = 12        # 距屏幕右边缘 / 上边缘的像素
     DOT_COLOR = "#8B5CF6"
     TRANSPARENT_KEY = "#0A0B0C"   # 魔术色，与紫色差异大，用作透明键
 
@@ -470,24 +530,16 @@ class FloatingDot:
         except tk.TclError:
             pass
 
-        self.canvas = tk.Canvas(
-            self.win, width=self.SIZE, height=self.SIZE,
-            bg=self.TRANSPARENT_KEY, highlightthickness=0, bd=0
+        png = build_dot_png(self.HIT, self.SIZE, self.DOT_COLOR, self.TRANSPARENT_KEY)
+        self.photo = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
+        self.label = tk.Label(
+            self.win, image=self.photo, bg=self.TRANSPARENT_KEY,
+            highlightthickness=0, bd=0, padx=0, pady=0
         )
-        pad = 2
-        self.canvas.create_oval(
-            pad, pad, self.SIZE - pad, self.SIZE - pad,
-            fill=self.DOT_COLOR, outline=""
-        )
-        self.canvas.pack()
-        for w in (self.canvas, self.win):
+        self.label.pack()
+        for w in (self.label, self.win):
             w.bind("<Double-Button-1>", self._activate)
             w.bind("<Double-Button-2>", self._activate)
-        # 短暂禁用双击间隔，方便快速双击
-        try:
-            self.canvas.configure(doubleclicktime=300)
-        except tk.TclError:
-            pass
 
         self.place_top_right()
 
@@ -497,8 +549,8 @@ class FloatingDot:
     def place_top_right(self):
         self.win.update_idletasks()
         sw = self.win.winfo_screenwidth()
-        x = max(0, sw - self.SIZE - self.MARGIN)
-        self.win.geometry(f"{self.SIZE}x{self.SIZE}+{x}+{self.MARGIN}")
+        x = max(0, sw - self.HIT - self.MARGIN)
+        self.win.geometry(f"{self.HIT}x{self.HIT}+{x}+{self.MARGIN}")
 
     def destroy(self):
         try:
@@ -768,7 +820,7 @@ class LoginWindow:
         self.win = tk.Toplevel(master)
         self.win.title("UCopy - 验证密码")
         self.win.resizable(False, False)
-        self.win.protocol("WM_DELETE_WINDOW", self.cancel_and_quit)
+        self.win.protocol("WM_DELETE_WINDOW", self.cancel)
 
         ttk.Label(self.win, text="请输入登录密码以进入设置面板",
                   font=("", 10)).grid(row=0, column=0, columnspan=2, padx=20, pady=(15, 6))
@@ -786,15 +838,25 @@ class LoginWindow:
         btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
         ttk.Button(btn_frame, text="确定", command=self.verify).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="忘记密码", command=self.forgot).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="取消", command=self.cancel_and_quit).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.cancel).pack(side=tk.LEFT, padx=5)
 
         self.win.bind("<Return>", lambda e: self.verify())
         self.win.grab_set()
 
-    def cancel_and_quit(self):
-        """取消登录：直接退出整个应用（密码保护下不应让用户绕过）"""
+    def cancel(self):
+        """
+        取消登录：只关闭密码窗口，程序与后台 U 盘复制继续运行。
+        （旧实现会直接退出整个程序，导致误点取消后 UCopy 静默消失）
+        """
+        try:
+            self.app.logger.info("用户取消密码输入，关闭登录窗口")
+        except Exception:
+            pass
+        try:
+            self.win.grab_release()
+        except tk.TclError:
+            pass
         self.win.destroy()
-        self.app.quit_app()
 
     def verify(self):
         if self._locked:
@@ -851,6 +913,7 @@ class LoginWindow:
         if not qa:
             messagebox.showerror("错误", "未配置密保问题，无法找回密码", parent=self.win)
             return
+        self.win.grab_release()
         self.win.withdraw()
         ForgotPasswordWindow(self.win, self.app, qa, on_reset=self._on_reset_done)
 
