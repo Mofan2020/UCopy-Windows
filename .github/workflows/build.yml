@@ -46,23 +46,41 @@ jobs:
           path: dist/UCopy.exe
 
       # ---------- 推 tag 时自动发 Release ----------
+      # 注意：Windows runner 默认 shell 是 PowerShell，$TAG 这类 bash 变量
+      # 不会被展开（会导致 gh 收到空 tag 而报 "tag required"），
+      # 所以这里直接用表达式插值，并把 shell 显式设为 bash。
       - name: Publish release (tag push)
         if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" "dist/UCopy.exe#UCopy.exe" --title "UCopy for Windows - $TAG" --generate-notes
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            "dist/UCopy.exe#UCopy.exe" \
+            --title "UCopy for Windows - ${{ github.ref_name }}" \
+            --generate-notes --verify-tag
 
       # ---------- 手动触发并指定版本号时发 Release ----------
+      # 未填说明时，尝试用 GitHub 自动生成；若该 tag 尚不存在导致生成失败，
+      # 回退到"自上个 Release 以来的 commit 列表"，保证发版不会因说明缺失而卡住。
       - name: Publish release (manual)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
           NOTES: ${{ inputs.release_notes }}
         run: |
           if [ -z "$NOTES" ]; then
-            NOTES=$(gh api "repos/${{ github.repository }}/releases/generate-notes" -f tag_name="$VERSION" --jq .body)
+            PREV=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+            if [ -n "$PREV" ]; then
+              NOTES=$(gh api "repos/${{ github.repository }}/releases/generate-notes" \
+                      -f tag_name="$VERSION" -f "notes_start_tag=$PREV" --jq .body 2>/dev/null || true)
+            fi
+            if [ -z "$NOTES" ]; then
+              NOTES=$(gh api "repos/${{ github.repository }}/compare/$PREV...$VERSION" \
+                      --jq '.commits[] | "- " + (.commit.message | split("\n")[0])' 2>/dev/null || echo "见 commit 记录")
+            fi
           fi
           gh release create "$VERSION" "dist/UCopy.exe#UCopy.exe" \
-            --title "UCopy for Windows - $VERSION" --notes "$NOTES"
+            --title "UCopy for Windows - $VERSION" --notes "$NOTES" --target "${{ github.sha }}"
