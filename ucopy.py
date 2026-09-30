@@ -458,7 +458,7 @@ def _blend(c1, c2, ratio):
     return tuple(int(round(a + (b - a) * ratio)) for a, b in zip(c1, c2))
 
 
-def build_dot_png(win_px, diameter, color, key, supersample=8):
+def build_dot_png(win_px, diameter, color, key, supersample=16):
     """
     生成一张 win_px x win_px 的 PNG：中央为 diameter 像素的圆，
     圆边缘做 supersample 抗锯齿处理，并把半透明像素预先混向透明键色。
@@ -507,16 +507,20 @@ def build_dot_png(win_px, diameter, color, key, supersample=8):
 class FloatingDot:
     """
     屏幕右上角常驻的紫色小圆点，替代原来的系统托盘图标。
-    无边框、置顶、背景色抠除做透明，双击打开设置面板。
+    无边框、置顶、背景色抠除做透明，连续点击 3 次才打开设置面板。
     """
-    SIZE = 8           # 小圆点直径（像素）
-    HIT = 24           # 透明点击区域边长，让 8px 的点也容易双击命中
-    MARGIN = 12        # 距屏幕右边缘 / 上边缘的像素
+    SIZE = 4           # 小圆点直径（像素）
+    HIT = 24           # 透明点击区域边长，让 4px 的点也好连续点中
+    MARGIN = 6         # 距屏幕右边缘 / 上边缘的像素
+    CLICKS_TO_OPEN = 3 # 需要连续点击的次数
+    CLICK_INTERVAL = 1.2   # 相邻两次点击的最大间隔（秒），超时则重新计数
     DOT_COLOR = "#8B5CF6"
     TRANSPARENT_KEY = "#0A0B0C"   # 魔术色，与紫色差异大，用作透明键
 
     def __init__(self, master, on_activate):
         self.on_activate = on_activate
+        self._clicks = 0
+        self._last_click = 0.0
         self.win = tk.Toplevel(master)
         self.win.overrideredirect(True)
         self.win.title("UCopy")
@@ -537,12 +541,35 @@ class FloatingDot:
             highlightthickness=0, bd=0, padx=0, pady=0
         )
         self.label.pack()
-        # 只在顶层窗口上绑定：若 label 和 toplevel 都绑，
-        # 一次双击会因 Tk 的 bindtag 传播被派发两次，导致开出两个窗口
-        self.win.bind("<Double-Button-1>", self._activate)
-        self.win.bind("<Double-Button-2>", self._activate)
+        # 只在顶层窗口上绑定单击：若 label 和 toplevel 都绑，
+        # 一次点击会因 Tk 的 bindtag 传播被派发两次，导致计数翻倍
+        self.win.bind("<Button-1>", self._on_click)
+        self.win.bind("<Button-2>", self._on_click)
+        self.win.bind("<Button-3>", self._on_click)
 
         self.place_top_right()
+
+    def _on_click(self, event=None):
+        """连续点击 CLICKS_TO_OPEN 次才触发，超时未达次数则重新计数"""
+        now = time.time()
+        if now - self._last_click > self.CLICK_INTERVAL:
+            self._clicks = 0
+        self._last_click = now
+        self._clicks += 1
+        if self._clicks < self.CLICKS_TO_OPEN:
+            # 中途超时自动归零
+            self.win.after(int(self.CLICK_INTERVAL * 1000), self._reset_clicks_if_idle)
+            # 返回 "break" 阻止事件继续沿 bindtag 传播，杜绝重复计数
+            return "break"
+        self._clicks = 0
+        # 返回 "break" 阻止事件继续沿 bindtag 传播，杜绝重复触发
+        self.on_activate()
+        return "break"
+
+    def _reset_clicks_if_idle(self):
+        now = time.time()
+        if self._clicks and now - self._last_click >= self.CLICK_INTERVAL:
+            self._clicks = 0
 
     def _activate(self, event=None):
         # 返回 "break" 阻止事件继续沿 bindtag 传播，杜绝重复触发
@@ -644,22 +671,22 @@ class UCopyApp:
             self.monitor = None
 
     def create_floating_dot(self):
-        """在屏幕右上角放一个置顶的紫色小圆点，双击打开设置面板。"""
+        """在屏幕右上角放一个置顶的紫色小圆点，连续点击三次打开设置面板。"""
         self.floating_dot = FloatingDot(self.root, on_activate=self.show_settings)
 
     def show_settings(self, event=None):
         """
-        打开设置面板的统一入口（小圆点双击触发）：
+        打开设置面板的统一入口（小圆点连续点击三次触发）：
           - 若已有面板/登录窗在开，直接前置，不重复创建
           - 若未设置过密码，强制进入 SecuritySetupWindow
           - 若已设置，弹 LoginWindow 校验密码
           - 校验通过后回调进入 SettingsWindow
 
         注意：面板占用标记从“弹登录窗”这一刻就置位（不是等到 SettingsWindow），
-        否则登录窗阶段 panel_open 仍为 False，一次双击会开出两个密码窗。
+        否则登录窗阶段 panel_open 仍为 False，一次点击会开出两个密码窗。
         """
         now = time.time()
-        # 双击事件可能因 Tk 的 bindtag 传播被派发多次，这里做 1 秒防抖兜底
+        # 事件可能因 Tk 的 bindtag 传播被派发多次，这里做 1 秒防抖兜底
         if now - self._last_open_ts < 1.0:
             return
         self._last_open_ts = now
@@ -707,7 +734,7 @@ class UCopyApp:
         self.init_logger()
         self.create_floating_dot()
         self.start_monitor()
-        # 首次启动引导设置密码；已有密码则不打扰，双击小圆点即可打开面板
+        # 首次启动引导设置密码；已有密码则不打扰，点击三次小圆点即可打开面板
         if not self.config.get("security", {}).get("password_hash"):
             self.root.after(500, self.show_settings)
         self.root.mainloop()
@@ -913,7 +940,7 @@ class LoginWindow:
             pass
         if left <= 0:
             # 达到上限：仅关闭密码窗口，程序与后台 U 盘复制继续运行，
-            # 留下审计日志供事后追溯。需要再试可再次双击右上角小圆点。
+            # 留下审计日志供事后追溯。需要再试可再次点击三次右上角小圆点。
             try:
                 self.app.logger.warning(
                     f"设置面板密码连续 {self.MAX_ATTEMPTS} 次错误，临时锁定，"
@@ -926,7 +953,7 @@ class LoginWindow:
             messagebox.showerror(
                 "已临时锁定",
                 f"密码连续 {self.MAX_ATTEMPTS} 次错误，已关闭设置面板。\n"
-                "后台 U 盘复制功能继续运行，需要时可再次双击右上角小圆点。",
+                "后台 U 盘复制功能继续运行，需要时可再次点击三次右上角小圆点。",
                 parent=self.app.root,
             )
             return
