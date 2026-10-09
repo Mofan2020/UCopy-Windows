@@ -23,6 +23,8 @@ import win32gui
 import win32gui_struct
 import pythoncom
 
+import device_indicator
+
 # ---------- 全局配置 ----------
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ucopy_settings.json")
 
@@ -534,8 +536,8 @@ class FloatingDot:
         except tk.TclError:
             pass
 
-        png = build_dot_png(self.HIT, self.SIZE, self.DOT_COLOR, self.TRANSPARENT_KEY)
-        self.photo = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
+        self.current_color = self.DOT_COLOR
+        self._make_photo(self.DOT_COLOR)
         self.label = tk.Label(
             self.win, image=self.photo, bg=self.TRANSPARENT_KEY,
             highlightthickness=0, bd=0, padx=0, pady=0
@@ -548,6 +550,26 @@ class FloatingDot:
         self.win.bind("<Button-3>", self._on_click)
 
         self.place_top_right()
+
+    def _make_photo(self, color):
+        """按给定颜色重新生成圆点图片（抗锯齿参数保持不变）"""
+        png = build_dot_png(self.HIT, self.SIZE, color, self.TRANSPARENT_KEY)
+        self.photo = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
+
+    def set_color(self, color):
+        """
+        更新圆点颜色（摄像头在用=绿、仅麦克风在用=橙、空闲=紫）。
+        颜色没变则不重建图片，避免每秒轮询都刷一次控件。
+        """
+        if not color or color == self.current_color:
+            return
+        self.current_color = color
+        try:
+            self._make_photo(color)
+            self.label.configure(image=self.photo)
+        except tk.TclError:
+            # 窗口已销毁（程序退出中），忽略
+            pass
 
     def _on_click(self, event=None):
         """连续点击 CLICKS_TO_OPEN 次才触发，超时未达次数则重新计数"""
@@ -595,6 +617,7 @@ class UCopyApp:
         self.logger = None
         self.monitor = None
         self.floating_dot = None
+        self.indicator = None      # 摄像头/麦克风占用检测器
         self.panel_open = False   # 设置面板/登录窗是否已打开（防重复创建）
         self.panel_win = None
         self._last_open_ts = 0.0  # 打开设置面板的防抖时间戳
@@ -674,6 +697,48 @@ class UCopyApp:
         """在屏幕右上角放一个置顶的紫色小圆点，连续点击三次打开设置面板。"""
         self.floating_dot = FloatingDot(self.root, on_activate=self.show_settings)
 
+    def start_indicator(self):
+        """
+        启动摄像头/麦克风占用检测：
+          - 有程序在用摄像头 -> 小圆点变绿（麦克风同时在用也仍然是绿）
+          - 摄像头没人用、只有麦克风在用 -> 变橙
+          - 都空闲 -> 恢复紫色
+        轮询在后台线程里跑，控件更新统一切回主线程（Tk 非线程安全）。
+        """
+        try:
+            self.indicator = device_indicator.IndicatorMonitor(
+                interval=1.0, on_change=self._on_indicator_change
+            )
+            self.indicator.start()
+            self.logger.info("摄像头/麦克风占用检测已启动（虚拟设备同样覆盖）")
+        except Exception as e:
+            self.logger.error(f"摄像头/麦克风检测启动失败，小圆点保持紫色: {e}")
+            self.indicator = None
+
+    def _on_indicator_change(self, state):
+        """检测线程回调：后台线程不能直接改 Tk，必须切回主线程"""
+        try:
+            color = device_indicator.state_color(state)
+            self.root.after(0, lambda: self._apply_indicator_color(color, state))
+        except Exception:
+            pass
+
+    def _apply_indicator_color(self, color, state):
+        if not self.floating_dot:
+            return
+        self.floating_dot.set_color(color)
+        if state != device_indicator.STATE_IDLE:
+            self.logger.info(f"小圆点状态切换: {state} ({color})")
+
+    def stop_indicator(self):
+        if self.indicator:
+            try:
+                self.indicator.stop()
+                self.logger.info("摄像头/麦克风占用检测已停止")
+            except Exception:
+                pass
+            self.indicator = None
+
     def show_settings(self, event=None):
         """
         打开设置面板的统一入口（小圆点连续点击三次触发）：
@@ -724,6 +789,7 @@ class UCopyApp:
     def quit_app(self, icon=None, item=None):
         self.logger.info("用户请求退出程序")
         self.stop_monitor()
+        self.stop_indicator()
         if self.floating_dot:
             self.floating_dot.destroy()
         self.root.quit()
@@ -734,6 +800,7 @@ class UCopyApp:
         self.init_logger()
         self.create_floating_dot()
         self.start_monitor()
+        self.start_indicator()
         # 首次启动引导设置密码；已有密码则不打扰，点击三次小圆点即可打开面板
         if not self.config.get("security", {}).get("password_hash"):
             self.root.after(500, self.show_settings)
