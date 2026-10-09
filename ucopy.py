@@ -1329,16 +1329,33 @@ class SettingsWindow:
         self.win.grab_set()
 
     def on_mode_changed(self, event=None):
-        """切换黑/白名单模式时，同步刷新按钮文字、列表状态标记和说明。"""
+        """
+        切换黑/白名单模式时：
+          1. 立刻把模式写回 app.config 并落盘
+          2. 同步刷新按钮文字、列表状态标记和说明
+
+        以前只改了 UI 文案，app.config 里的 device_list_mode 没变，
+        而 U 盘插入的复制判定读的是 app.config —— 于是「切到白名单后
+        不点保存就插 U 盘」仍然按黑名单执行，看起来就是白名单不工作。
+        """
         mode = normalize_list_mode(self.list_mode_var.get())
         noun = list_mode_noun(mode)
         if mode == "blacklist":
-            hint = "黑名单：名单内的 U 盘不复制，其余都复制"
+            hint = "黑名单：名单内的 U 盘不复制，其余都复制；切换模式会立即生效"
             self.toggle_btn.config(text="加入/移出黑名单")
         else:
-            hint = "白名单：只有名单内的 U 盘才复制，其余都不复制"
+            hint = "白名单：只有名单内的 U 盘才复制，其余都不复制；切换模式会立即生效"
             self.toggle_btn.config(text="加入/移出白名单")
         self.mode_hint_var.set(hint)
+
+        # 立即生效：写回配置并落盘，不依赖「保存并隐藏」
+        if self.app.config.get("device_list_mode") != mode:
+            self.app.config["device_list_mode"] = mode
+            save_config(self.app.config)
+            try:
+                self.app.logger.info(f"名单模式已切换为{LIST_MODE_LABELS[mode]}，立即生效")
+            except Exception:
+                pass
         self.refresh_device_list()
 
     def browse_target(self):
