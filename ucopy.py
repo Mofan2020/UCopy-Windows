@@ -56,6 +56,10 @@ DEFAULT_CONFIG = {
     # known_devices[uid] = {"label": str, "first_seen": str, "listed": bool}
     # "listed" 的含义随模式变化：黑名单下 true=拉黑，白名单下 true=放行
     "known_devices": {},
+    # 摄像头/麦克风占用指示灯：长时间空闲时降频省 CPU（详见 device_indicator 模块）
+    "indicator_slowdown": True,
+    "indicator_active_interval": 1.0,
+    "indicator_idle_interval": 5.0,
     "security": {
         "password_hash": "",
         "password_salt": "",
@@ -128,6 +132,14 @@ def get_config():
                 )
         # 名单模式归一化
         cfg["device_list_mode"] = normalize_list_mode(cfg.get("device_list_mode"))
+        # 指示灯参数类型归一化（旧配置可能是错的字符串/None）
+        cfg["indicator_slowdown"] = bool(cfg.get("indicator_slowdown", True))
+        for k, default in (("indicator_active_interval", 1.0),
+                           ("indicator_idle_interval", 5.0)):
+            try:
+                cfg[k] = max(0.01, float(cfg.get(k, default)))
+            except (TypeError, ValueError):
+                cfg[k] = default
         # 旧版本用 blacklisted 字段表示"在黑名单里"，迁移成通用的 listed。
         # 迁移必须结合当前模式：白名单模式下 listed 的含义与 blacklisted 相反。
         mode = cfg["device_list_mode"]
@@ -704,10 +716,18 @@ class UCopyApp:
           - 摄像头没人用、只有麦克风在用 -> 变橙
           - 都空闲 -> 恢复紫色
         轮询在后台线程里跑，控件更新统一切回主线程（Tk 非线程安全）。
+
+        长时间空闲时会自动降频（默认 5s 一次），检测到占用立刻恢复到 1s，
+        保证首次变化延迟仍是 1s。可通过 config["indicator_slowdown"]=False 关掉。
         """
         try:
+            cfg = self.config
             self.indicator = device_indicator.IndicatorMonitor(
-                interval=1.0, on_change=self._on_indicator_change
+                active_interval=float(cfg.get("indicator_active_interval", 1.0)),
+                idle_interval=float(cfg.get("indicator_idle_interval", 5.0)),
+                enable_idle_slowdown=bool(cfg.get("indicator_slowdown", True)),
+                on_change=self._on_indicator_change,
+                on_unknown_streak=self._on_indicator_unknown_streak,
             )
             self.indicator.start()
             self.logger.info("摄像头/麦克风占用检测已启动（虚拟设备同样覆盖）")
@@ -729,6 +749,22 @@ class UCopyApp:
         self.floating_dot.set_color(color)
         if state != device_indicator.STATE_IDLE:
             self.logger.info(f"小圆点状态切换: {state} ({color})")
+
+    def _on_indicator_unknown_streak(self, n):
+        """持续 N 次探测都失败（连续 (None, None)）时记录一条 warning。
+
+        n=0 是恢复信号（已探测到真实状态），不记录。n≥1 时写日志一次即可，
+        设备指示灯模块内部已防 spam。
+        """
+        if n <= 0:
+            return
+        try:
+            self.logger.warning(
+                f"摄像头/麦克风检测已连续 {n} 次失败（无法判定占用状态，"
+                f"指示灯保持紫色）"
+            )
+        except Exception:
+            pass
 
     def stop_indicator(self):
         if self.indicator:

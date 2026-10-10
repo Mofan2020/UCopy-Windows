@@ -99,6 +99,28 @@ STATE_COLORS = {
     STATE_MIC: COLOR_MIC,
 }
 
+# ---------- Windows DLL 缓存 ----------
+# 1Hz 轮询下，每次重新 WinDLL("setupapi.dll") / WinDLL("winmm.dll") 都会触发一次
+# 重复的 LoadLibrary + argtypes/restype 绑定——既浪费 CPU，也容易触发反病毒软件告警。
+# 这里用模块级缓存：首次懒加载后，整个进程复用同一份 DLL 对象 + 绑定。
+_WIN32_DLLS = {}
+
+
+def _win32_dll(name):
+    """懒加载并缓存 Win32 DLL。多次调用返回同一对象。"""
+    cached = _WIN32_DLLS.get(name)
+    if cached is not None:
+        return cached
+    dll = ctypes.WinDLL(name, use_last_error=True)
+    _WIN32_DLLS[name] = dll
+    return dll
+
+
+def _reset_win32_dll_cache():
+    """清空 DLL 缓存（仅测试用）。"""
+    _WIN32_DLLS.clear()
+
+
 # ---------- Windows 常量（模块级只是整数，不触发任何 API 调用） ----------
 _WIN = sys.platform == "win32"
 
@@ -138,6 +160,10 @@ WAVE_FORMAT_QUERY = 0x80000000
 CALLBACK_NULL = 0
 
 DEFAULT_INTERVAL = 1.0
+DEFAULT_ACTIVE_INTERVAL = 1.0   # 检测到占用时（active 状态）的轮询间隔
+DEFAULT_IDLE_INTERVAL = 5.0     # 长时间空闲时的轮询间隔（节能）
+DEFAULT_UNKNOWN_STREAK = 3      # 连续多少次 (None, None) 触发"探测失败"回调
+MIN_INTERVAL = 0.01             # 间隔下限，防止误设到 0.001 把 CPU 跑满
 
 
 def _log_debug(msg, *args):
@@ -265,9 +291,13 @@ def _guid(text):
 
 
 def _load_setupapi():
-    """懒加载 setupapi.dll（import 本模块时不会走到这里）。"""
-    setupapi = ctypes.WinDLL("setupapi.dll", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    """懒加载 setupapi.dll + kernel32.dll（import 本模块时不会走到这里）。
+
+    DLL 通过 _win32_dll() 模块级缓存：多次调用返回同一对象，避免 1Hz 轮询下
+    重复 LoadLibrary / 重复绑定 argtypes。
+    """
+    setupapi = _win32_dll("setupapi.dll")
+    kernel32 = _win32_dll("kernel32.dll")
 
     setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
     setupapi.SetupDiGetClassDevsW.argtypes = [
@@ -300,7 +330,7 @@ def _load_setupapi():
 
 
 def _load_winmm():
-    winmm = ctypes.WinDLL("winmm")
+    winmm = _win32_dll("winmm.dll")
     winmm.waveInGetNumDevs.restype = ctypes.c_uint
     winmm.waveInGetDevCapsW.restype = ctypes.c_uint
     winmm.waveInGetDevCapsW.argtypes = [
@@ -605,12 +635,40 @@ class IndicatorMonitor:
     * start()/stop() 用 threading.Event 控制，不用 sleep 轮询，stop() 能
       干净地结束线程（最迟在当前采样结束后立即返回）。
     * probe 可注入（默认用本模块的 probe），便于在任意平台做纯逻辑测试。
+
+    节能策略（enable_idle_slowdown=True 时生效）：
+      - 检测到占用（state != IDLE）-> 用 active_interval（默认 1s）
+      - 连续空闲 N 次后          -> 切到 idle_interval（默认 5s）
+      - 状态一旦变化立刻回到 active_interval，**首次变化延迟仍是 active_interval**
+      - enable_idle_slowdown=False 时退化为恒定 interval（兼容旧行为）
+
+    持续未知告警（on_unknown_streak 可选）：
+      - 连续 N 次 (None, None) -> 触发 on_unknown_streak(N)
+      - 中途恢复或得到真实状态 -> 触发 on_unknown_streak(0) 复位
+      - 仅触发一次以避免日志 spam
     """
 
     def __init__(self, interval=DEFAULT_INTERVAL, on_change=None,
-                 conservative=True, probe_fn=None, notify_initial=False):
-        self.interval = max(0.05, float(interval))
+                 conservative=True, probe_fn=None, notify_initial=False,
+                 active_interval=None,
+                 idle_interval=DEFAULT_IDLE_INTERVAL,
+                 enable_idle_slowdown=True,
+                 unknown_streak_threshold=DEFAULT_UNKNOWN_STREAK,
+                 on_unknown_streak=None):
+        # 旧 interval 参数向后兼容：如果用户显式传了 interval 而没传 active_interval，
+        # 用 interval 作为 active_interval；否则使用 active_interval 的默认值。
+        # 用 None 作为 sentinel 区分"未传"。
+        if active_interval is None:
+            active_interval = interval
+        self.active_interval = max(MIN_INTERVAL, float(active_interval))
+        self.idle_interval = max(self.active_interval, float(idle_interval))
+        self.enable_idle_slowdown = bool(enable_idle_slowdown)
+        self.unknown_streak_threshold = max(1, int(unknown_streak_threshold))
+        # 兼容旧 interval 参数：m.interval 字段保留可读，但实际线程跑 active_interval
+        self.interval = self.active_interval  # 旧 API 兼容字段
+
         self.on_change = on_change
+        self.on_unknown_streak = on_unknown_streak
         self.conservative = conservative
         self._probe = probe_fn or (lambda: probe(self.conservative))
         self.notify_initial = notify_initial
@@ -620,6 +678,14 @@ class IndicatorMonitor:
         self._state = STATE_IDLE
         # 首次采样是否需要通知上层（notify_initial=True 时通知一次 idle 初始态）
         self._fired_once = not self.notify_initial
+        # 是否已经有过至少一次采样（独立于 _fired_once 标志，用于驱动 idle 计数）
+        self._ever_sampled = False
+
+        # 节能状态：连续多少个不变采样后才进入空闲降频
+        self._idle_counter = 0
+        # 持续未知状态计数
+        self._unknown_counter = 0
+        self._unknown_alerted = False  # 防 spam：同一轮未知 streak 只回调一次
 
         self._thread = None
         self._stop_event = threading.Event()
@@ -641,19 +707,43 @@ class IndicatorMonitor:
     def running(self):
         return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def current_interval(self):
+        """当前线程实际使用的轮询间隔（用于测试与排障）。"""
+        if not self.enable_idle_slowdown:
+            return self.active_interval
+        # 节能策略：进入空闲模式后用 idle_interval
+        # 阈值为 1 次 active 间隔（语义清晰即可，复杂策略不值）
+        return self.idle_interval if self._idle_counter > 0 else self.active_interval
+
     # ---------- 状态推进（可注入状态值，纯逻辑，便于测试） ----------
     def apply(self, camera, mic, fire=True):
         """把一组采样值并入状态机，返回新状态。
 
         这是整个模块唯一改变状态的地方；on_change 只在状态变化时触发。
+        持续未知计数 / 节能计数器在这里推进。
         """
         with self._lock:
             self.camera_in_use = camera
             self.mic_in_use = mic
             new_state = indicator_state(camera, mic)
             changed = new_state != self._state or not self._fired_once
+            prev_state = self._state
+            is_first_sample = not self._ever_sampled
             self._fired_once = True
+            self._ever_sampled = True
             self._state = new_state
+        # 状态推进后更新节能计数器。
+        # 「首次采样」不算纯状态变化，避免一开始 idle_counter 就被 +1 导致
+        # 立刻切到 idle_interval。
+        pure_change = (new_state != prev_state)
+        if is_first_sample:
+            # 首次采样：模拟为一次变化，让 _update_idle_counter 走清零分支
+            self._update_idle_counter(True, prev_state, new_state, camera, mic)
+        else:
+            self._update_idle_counter(pure_change, prev_state, new_state, camera, mic)
+        # 状态推进后更新持续未知计数并可能触发告警回调
+        self._update_unknown_streak(camera, mic, fire=fire)
         # 只有「状态真的变了」才唤醒上层；notify_initial=True 时首次采样也通知一次
         if fire and self.on_change is not None and changed:
             try:
@@ -661,6 +751,59 @@ class IndicatorMonitor:
             except Exception as exc:
                 _log_debug("on_change 回调异常: %r", exc)
         return new_state
+
+    def _update_idle_counter(self, changed, prev_state, new_state, camera, mic):
+        """更新节能降频用的空闲计数。
+
+        规则：
+          - 探测结果是未知 (None, None) -> 立刻清零、不进入降频（探测异常时
+            需要尽快恢复检测，不能省事把间隔拉长）
+          - 状态变化 -> 立刻清零（保持 active 频率，保证首次变化延迟 < active_interval）
+          - 状态不变 + 新状态是 IDLE -> 计数 +1（连续空闲越久越省）
+          - 状态不变 + 新状态非 IDLE -> 计数清零（仍在用，按 active 频率跑）
+        """
+        if not self.enable_idle_slowdown:
+            self._idle_counter = 0
+            return
+        # 未知状态绝不进入降频——需要尽快恢复检测
+        if camera is None and mic is None:
+            self._idle_counter = 0
+            return
+        if changed:
+            self._idle_counter = 0
+            return
+        if new_state == STATE_IDLE:
+            self._idle_counter += 1
+        else:
+            self._idle_counter = 0
+
+    def _update_unknown_streak(self, camera, mic, fire=True):
+        """连续 (None, None) 计数与告警回调。
+
+        - 触发时机：连续 unknown_streak_threshold 次 (None, None)
+        - 复位时机：得到任意真实状态（摄像头或麦克风已知是 True/False）
+        - 同一轮未知期间仅回调一次（防止日志 spam）
+        """
+        is_unknown = (camera is None and mic is None)
+        if is_unknown:
+            self._unknown_counter += 1
+            if (not self._unknown_alerted
+                    and self._unknown_counter >= self.unknown_streak_threshold
+                    and fire and self.on_unknown_streak is not None):
+                try:
+                    self.on_unknown_streak(self._unknown_counter)
+                except Exception as exc:
+                    _log_debug("on_unknown_streak 回调异常: %r", exc)
+                self._unknown_alerted = True
+            return
+        # 已知状态 -> 复位
+        if self._unknown_alerted and fire and self.on_unknown_streak is not None:
+            try:
+                self.on_unknown_streak(0)
+            except Exception as exc:
+                _log_debug("on_unknown_streak 复位回调异常: %r", exc)
+        self._unknown_counter = 0
+        self._unknown_alerted = False
 
     # ---------- 线程生命周期 ----------
     def _run(self):
@@ -672,9 +815,11 @@ class IndicatorMonitor:
                 _log_debug("探测异常，回退为未知: %r", exc)
                 camera, mic = None, None
             self.apply(camera, mic)
+            # 根据当前是否进入空闲模式动态选择间隔
+            wait_sec = self.current_interval
             # Event.wait 代替 sleep：stop() 能立刻唤醒
             elapsed = time.time() - started
-            self._stop_event.wait(max(0.0, self.interval - elapsed))
+            self._stop_event.wait(max(0.0, wait_sec - elapsed))
 
     def start(self):
         """启动后台 daemon 线程。重复调用是安全的（幂等）。"""
@@ -805,6 +950,204 @@ def _run_selftest():
               camera_in_use(False) is False and mic_in_use(False) is False)
     check("probe() 在任意平台都返回两个三值",
           len(probe()) == 2)
+
+    # --- 10. DLL 缓存：多次调用返回同一对象，不重复 LoadLibrary ---
+    # macOS 上 ctypes.WinDLL 不存在，所以这部分统一用 monkey-patch 占位
+    # ctypes.WinDLL 后再跑；Windows 上 _win32_dll 已存在但本身无害。
+    _calls = {"n": 0}
+    _stub_objects = {}
+
+    class _StubDll:
+        """接受任意属性读写的占位 DLL（支持 setupapi.SetupDiGetClassDevsW.restype = ...）。"""
+
+        def __init__(self, name):
+            self._name = name
+
+        def __repr__(self):
+            return f"<StubDll {self._name}>"
+
+        def __getattr__(self, attr):
+            # 任意属性访问都返回一个新的 StubSlot，能继续被赋值/读取
+            return _StubSlot(self._name, attr)
+
+    class _StubSlot:
+        """属性赋值的占位槽位（restype/argtypes 等）。"""
+
+        def __init__(self, dll_name, attr_name):
+            self._dll = dll_name
+            self._attr = attr_name
+            self.value = None
+
+        def __repr__(self):
+            return f"<StubSlot {self._dll}.{self._attr}>"
+
+    def _stub_windll(name, use_last_error=False):
+        _calls["n"] += 1
+        obj = _StubDll(name)
+        _stub_objects[(name, use_last_error)] = obj
+        return obj
+
+    _orig_windll = getattr(ctypes, "WinDLL", None)
+    ctypes.WinDLL = _stub_windll
+    try:
+        _reset_win32_dll_cache()
+        a = _win32_dll("setupapi.dll")
+        b = _win32_dll("setupapi.dll")
+        c = _win32_dll("kernel32.dll")
+        check("DLL 缓存：_win32_dll 多次调用返回同一对象",
+              a is b and a is not c)
+        check("DLL 缓存：模块级 dict 同时持有多个 DLL",
+              "setupapi.dll" in _WIN32_DLLS and "kernel32.dll" in _WIN32_DLLS)
+        # 懒加载语义：调用前 cache 为空，调用后才有键
+        _reset_win32_dll_cache()
+        check("DLL 缓存：调用前 _WIN32_DLLS 为空", len(_WIN32_DLLS) == 0)
+        _win32_dll("winmm.dll")
+        check("DLL 缓存：调用后 _WIN32_DLLS 出现 winmm.dll",
+              "winmm.dll" in _WIN32_DLLS)
+        # _load_setupapi / _load_winmm 走缓存路径：第二次不重新调用 ctypes.WinDLL
+        _reset_win32_dll_cache()
+        _calls["n"] = 0
+        _load_setupapi()
+        n1 = _calls["n"]
+        _load_setupapi()
+        n2 = _calls["n"]
+        check("_load_setupapi 走缓存：第二次不重新调用 ctypes.WinDLL",
+              n1 == 2 and n2 == n1)
+        _load_winmm()
+        n3 = _calls["n"]
+        _load_winmm()
+        n4 = _calls["n"]
+        check("_load_winmm 走缓存：第二次不重新调用 ctypes.WinDLL",
+              n3 == n1 + 1 and n4 == n3)
+    finally:
+        if _orig_windll is not None:
+            ctypes.WinDLL = _orig_windll
+        else:
+            try:
+                del ctypes.WinDLL
+            except AttributeError:
+                pass
+        _reset_win32_dll_cache()
+
+    # --- 11. 旧 interval 参数向后兼容：显式传 interval 也能跑 ---
+    m_old = IndicatorMonitor(interval=0.07)
+    check("旧 interval 参数：active_interval 被设到 0.07",
+          abs(m_old.active_interval - 0.07) < 1e-9)
+    check("旧 interval 参数：idle_interval 不低于 active_interval",
+          m_old.idle_interval >= m_old.active_interval)
+    check("旧 interval 参数：m.interval 字段仍可读且等于 active_interval",
+          m_old.interval == m_old.active_interval)
+
+    # --- 12. 智能降频：空闲状态下 current_interval 切到 idle_interval ---
+    m_sd = IndicatorMonitor(
+        interval=0.05, active_interval=0.05, idle_interval=0.20,
+        enable_idle_slowdown=True,
+        probe_fn=lambda: (False, False),
+    )
+    check("初始状态 current_interval == active_interval",
+          m_sd.current_interval == 0.05)
+    # 首次 apply 必触发一次「变化」-> _idle_counter 清零、interval=active
+    m_sd.apply(False, False, fire=False)
+    check("首次 apply 后 current_interval 仍为 active_interval",
+          m_sd.current_interval == 0.05)
+    # 第二次相同采样 -> 进入 idle，counter=1
+    m_sd.apply(False, False, fire=False)
+    check("第二次相同采样 -> 切到 idle_interval",
+          m_sd.current_interval == 0.20)
+    # 第三次仍空闲 -> 仍 idle
+    m_sd.apply(False, False, fire=False)
+    check("连续空闲期间保持 idle_interval",
+          m_sd.current_interval == 0.20)
+    # 状态变化 -> 立刻回到 active_interval
+    m_sd.apply(True, False, fire=False)
+    check("状态变化立刻回到 active_interval",
+          m_sd.current_interval == 0.05)
+    # 再变回 idle -> 又进入降频
+    m_sd.apply(False, False, fire=False)
+    m_sd.apply(False, False, fire=False)
+    check("变化后再空闲，重新进入 idle_interval",
+          m_sd.current_interval == 0.20)
+
+    # 关闭开关 -> 始终 active_interval
+    m_off = IndicatorMonitor(
+        interval=0.05, active_interval=0.05, idle_interval=0.20,
+        enable_idle_slowdown=False,
+        probe_fn=lambda: (False, False),
+    )
+    m_off.apply(False, False, fire=False)
+    m_off.apply(False, False, fire=False)
+    m_off.apply(False, False, fire=False)
+    check("enable_idle_slowdown=False 时始终 active_interval",
+          m_off.current_interval == 0.05)
+
+    # 线程实际跑的 wait 时间也要符合预期
+    waits = []
+    m_thread = IndicatorMonitor(
+        active_interval=0.05, idle_interval=0.20,
+        enable_idle_slowdown=True, probe_fn=lambda: (False, False),
+    )
+    # 用 monkey-patch 替换 Event.wait，捕获每次的实际等待时长
+    _orig_wait = threading.Event.wait
+    def _spy_wait(self, timeout=None):
+        waits.append(timeout)
+        return _orig_wait(self, 0)  # 立刻返回，便于测试快速结束
+    threading.Event.wait = _spy_wait
+    try:
+        m_thread.start()
+        _sleep(0.30)
+    finally:
+        m_thread.stop()
+        threading.Event.wait = _orig_wait
+    check("线程运行产生多次 wait 调用（>=3）", len(waits) >= 3)
+    if waits:
+        # 第一次进入空闲前的 wait 应是 active_interval
+        # 进入空闲后的 wait 应是 idle_interval
+        check("首个 wait 接近 active_interval",
+              abs((waits[0] or 0) - 0.05) < 0.06)
+        check("后续 wait 切到 idle_interval",
+              any((w or 0) >= 0.19 for w in waits[1:]))
+
+    # --- 13. 持续未知告警回调 ---
+    streak_calls = []
+
+    def _on_streak(n):
+        streak_calls.append(n)
+
+    m_unk = IndicatorMonitor(
+        interval=0.02, unknown_streak_threshold=3,
+        on_unknown_streak=_on_streak,
+        probe_fn=lambda: (None, None),
+    )
+    m_unk.start()
+    _sleep(0.30)  # 至少跑出 ≥3 次 (None, None)
+    # 恢复一次真实状态 -> 应触发复位回调（参数 0）
+    m_unk._probe = lambda: (True, False)
+    _sleep(0.20)
+    m_unk.stop()
+    check("持续未知触发告警回调（至少 1 次）",
+          any(c >= 3 for c in streak_calls))
+    check("恢复真实状态触发复位回调（参数 0）",
+          0 in streak_calls)
+    check("告警回调在 streak 期间只触发 1 次（防 spam）",
+          sum(1 for c in streak_calls if c >= 3) == 1)
+    # 计数器与告警标记在恢复后清零
+    check("恢复后 _unknown_counter 清零", m_unk._unknown_counter == 0)
+    check("恢复后 _unknown_alerted 清零", m_unk._unknown_alerted is False)
+
+    # --- 14. 节能降频计数器和未知计数互不影响 ---
+    m_iso = IndicatorMonitor(
+        interval=0.02, active_interval=0.02, idle_interval=0.10,
+        enable_idle_slowdown=True,
+        unknown_streak_threshold=2,
+        probe_fn=lambda: (None, None),  # 全未知 -> 节能不进入
+    )
+    m_iso.apply(None, None, fire=False)
+    check("全未知期间 current_interval 仍是 active_interval（未知≠空闲）",
+          m_iso.current_interval == 0.02)
+    # 再来一次仍是 active
+    m_iso.apply(None, None, fire=False)
+    check("全未知期间 current_interval 不切到 idle_interval",
+          m_iso.current_interval == 0.02)
 
     # --- 输出 ---
     passed = 0
