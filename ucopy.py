@@ -270,6 +270,48 @@ def should_copy_file(filename, extensions, pattern):
             return False
     return True
 
+
+# ---------- 智能 diff：复制决策（mtime + size） ----------
+# 用 FAT/NTFS 常见的时间戳精度 1 秒做容差：
+#   - Windows FAT32/NTFS 文件系统对 mtime 的精度通常是 100ns，但很多 U 盘
+#     控制器 / 跨设备拷贝会落到 1 秒甚至 2 秒；用 1 秒容差对真正"刚刚改过"
+#     的文件（用户改完保存）几乎没有误判。
+DEFAULT_MTIME_TOLERANCE = 1.0
+
+
+def is_dest_same_as_src(src_stat, dst_stat, mtime_tolerance=DEFAULT_MTIME_TOLERANCE):
+    """判断目标文件是否与源文件一致（大小 + 修改时间）。
+
+    返回 True 表示目标已经和源相同，无需重新复制。
+    """
+    if src_stat is None or dst_stat is None:
+        return False
+    if src_stat.st_size != dst_stat.st_size:
+        return False
+    return abs(src_stat.st_mtime - dst_stat.st_mtime) <= mtime_tolerance
+
+
+def should_skip_copy(src_file, dest_file, mtime_tolerance=DEFAULT_MTIME_TOLERANCE):
+    """决定是否要跳过对 (src_file -> dest_file) 的复制。
+
+    判定：
+      - dest_file 不存在               -> 不跳过（要复制）
+      - 存在 + 大小+mtime 一致（容差内） -> 跳过（视为同文件）
+      - 存在 + 大小或 mtime 不同         -> 不跳过（要覆盖）
+
+    任意一次 stat 异常（权限、临时占用、文件被删）都按「不跳过」处理，
+    让复制流程自己负责报错，避免因为探测本身失败导致误跳过。
+    """
+    try:
+        src_stat = os.stat(src_file)
+    except OSError:
+        return False
+    try:
+        dst_stat = os.stat(dest_file)
+    except OSError:
+        return False
+    return is_dest_same_as_src(src_stat, dst_stat, mtime_tolerance)
+
 def copy_drive(drive_letter, config):
     """执行复制，返回 (success, message)"""
     logger = logging.getLogger("UCopy")
@@ -347,7 +389,23 @@ def copy_drive(drive_letter, config):
                 dest_file = os.path.join(dest_dir, fn)
                 temp_file = dest_file + ".ucopy"
 
+                # 智能 diff：目标已经和源一致（同大小 + mtime 容差内）则跳过，
+                # 避免每次插入 U 盘都把整盘重写一遍。
+                # 任何决策异常都按「需要复制」处理，复制流程自己负责报错。
+                if should_skip_copy(src_file, dest_file):
+                    skipped_count += 1
+                    logger.debug(f"跳过(无变化): {src_file}")
+                    continue
+
                 try:
+                    # 清掉上一次中断可能留下的 .ucopy 残留，
+                    # 否则 win32file.CopyFile(False) 会直接抛「文件已存在」，
+                    # 导致本次复制白白失败。
+                    if os.path.exists(temp_file):
+                        try:
+                            os.remove(temp_file)
+                        except OSError:
+                            pass
                     win32file.CopyFile(src_file, temp_file, False)
                     # 保留时间戳
                     try:
@@ -355,7 +413,12 @@ def copy_drive(drive_letter, config):
                         os.utime(temp_file, (st.st_atime, st.st_mtime))
                     except:
                         pass
-                    os.rename(temp_file, dest_file)
+                    # 用 os.replace 而非 os.rename：
+                    # Windows 上 os.rename 遇到目标已存在会抛 FileExistsError，
+                    # 导致「目标文件已存在 + 内容不同」时无法覆盖 —— 这正是用户
+                    # 反馈的「复制功能工作不正常」的核心根因之一。
+                    # os.replace 跨平台语义一致：原子覆盖目标。
+                    os.replace(temp_file, dest_file)
                     logger.info(f"复制成功: {src_file} -> {dest_file}")
                     copied_count += 1
                 except Exception as e:
@@ -368,7 +431,7 @@ def copy_drive(drive_letter, config):
                     skipped_count += 1
                     continue
 
-        msg = f"复制完成：{copied_count} 个文件，跳过 {skipped_count} 个"
+        msg = f"复制完成：{copied_count} 个文件被复制，跳过 {skipped_count} 个（含无变化）"
         logger.info(msg)
         return True, msg
     except Exception as e:
@@ -523,8 +586,8 @@ class FloatingDot:
     屏幕右上角常驻的紫色小圆点，替代原来的系统托盘图标。
     无边框、置顶、背景色抠除做透明，连续点击 3 次才打开设置面板。
     """
-    SIZE = 4           # 小圆点直径（像素）
-    HIT = 24           # 透明点击区域边长，让 4px 的点也好连续点中
+    SIZE = 6           # 小圆点直径（像素）
+    HIT = 24           # 透明点击区域边长，让小点也好连续点中
     MARGIN = 6         # 距屏幕右边缘 / 上边缘的像素
     CLICKS_TO_OPEN = 3 # 需要连续点击的次数
     CLICK_INTERVAL = 1.2   # 相邻两次点击的最大间隔（秒），超时则重新计数

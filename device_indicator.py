@@ -147,8 +147,13 @@ ERROR_INVALID_HANDLE = 6
 ERROR_SHARING_VIOLATION = 32
 ERROR_BUSY = 170
 
-# 「占用类」错误白名单：只有命中这些才判定为占用
-CAMERA_IN_USE_ERRORS = frozenset((ERROR_SHARING_VIOLATION, ERROR_BUSY, 100, 1117))
+# 「占用类」错误白名单：只有命中这些才判定为占用。
+# 注意加入 ERROR_ACCESS_DENIED(5)：
+#   系统自带「拍照」、第三方录屏软件（ev录频、Bandicam 等）以独占方式打开摄像头
+#   时，部分驱动对其它进程返回 ACCESS_DENIED 而非 SHARING_VIOLATION。
+#   没有它会漏掉绝大多数日常使用场景。
+CAMERA_IN_USE_ERRORS = frozenset((ERROR_SHARING_VIOLATION, ERROR_BUSY,
+                                  ERROR_ACCESS_DENIED, 100, 1117))
 
 MMSYSERR_NOERROR = 0
 MMSYSERR_ALLOCATED = 10
@@ -512,8 +517,20 @@ def camera_in_use(conservative=True):
     """摄像头是否正在被任意程序使用。
 
     返回 True / False / None(未知)。
-    conservative=True（默认）时，任何探测不可靠（枚举失败、全部设备都打不开）
-    返回 None；conservative=False 时把未知折算成 False（当作空闲）。
+
+    判定逻辑：
+      1. 枚举所有 PRESENT 的摄像头设备接口路径；
+      2. 对每条路径做独占打开尝试：
+         - 打开成功                 -> 该设备空闲
+         - 返回占用类错误（SHARING_VIOLATION / BUSY / ACCESS_DENIED / 等）
+                                   -> 该设备疑似占用
+         - 其它错误（路径失效、权限不足以外的） -> 忽略该设备
+      3. 多源确认，避免单设备驱动权限问题造成的假亮灯：
+         - 0 个疑似占用设备       -> False（全部空闲）
+         - 1 个枚举设备 + 1 个疑似 -> True（单设备时单证据即算占用）
+         - 2+ 个枚举设备 + 全部疑似 -> True（多设备时需要全员确认）
+         - 2+ 个枚举设备 + 部分疑似 -> 1 个时算 True，多个则要求至少 2 个
+         - 全部都打开失败（疑似但又没拿到明确证据）-> None（未知）
     """
     if not _WIN:
         # 非 Windows 平台没有可探测的摄像头类别
@@ -521,29 +538,55 @@ def camera_in_use(conservative=True):
     probed = 0
     try:
         paths = _enumerate_camera_paths()
-        _setupapi, kernel32 = _load_setupapi()
     except Exception as exc:
         _log_debug("摄像头枚举异常: %r", exc)
+        return False if not conservative else None
+    try:
+        _setupapi, kernel32 = _load_setupapi()
+    except Exception as exc:
+        _log_debug("setupapi/kernel32 加载异常: %r", exc)
         return False if not conservative else None
 
     if not paths:
         # 一个摄像头设备都没接：不可能有程序在占用 -> 空闲
         return False
 
+    in_use_count = 0
+    non_in_use_errors = 0  # 拿到了明确的非占用类错误（驱动权限错配、路径失效等）
     for path in paths:
         try:
             opened, in_use_err = _open_variants(kernel32, path)
         except Exception as exc:
             _log_debug("探测摄像头设备异常 %s: %r", path, exc)
             continue
-        if in_use_err is not None:
-            return True           # 明确的共享冲突/占用
-        if opened:
-            probed += 1           # 能打开 -> 空闲
+        if opened and in_use_err is None:
+            # 唯一明确的空闲信号：打开成功且没有任何错误码
+            probed += 1
+        elif in_use_err in CAMERA_IN_USE_ERRORS:
+            in_use_count += 1
+        elif in_use_err is not None:
+            # 拿到了错误码但不在占用白名单（驱动权限错配 / 路径失效等）
+            # 不算占用，也不算空闲 —— 「未知」信号
+            non_in_use_errors += 1
         else:
-            _log_debug("摄像头设备 %s 各种方式都打不开，忽略", path)
+            _log_debug("摄像头设备 %s 打开但返回了未知结果，忽略", path)
 
-    return False if probed else (False if not conservative else None)
+    if in_use_count == 0:
+        # 没有任一设备返回明确的占用信号
+        if non_in_use_errors > 0 and probed == 0:
+            # 全部都拿到非占用类错误码（路径失效 / 权限错配），按未知处理
+            return False if not conservative else None
+        return False if probed else (False if not conservative else None)
+
+    # 至少有一个设备返回占用类错误：
+    #   - 单设备机器：1 个证据就够
+    #   - 多设备机器：1 个证据也算占用
+    #     （典型场景：笔记本有内置摄像头 + 外接 USB 摄像头，
+    #      但用户只用其中一个，另一个可能被 Windows 单独占用做后台用途，
+    #      这时第二个设备的状态不能否决第一个的真占用信号）
+    #   多源「否决」语义由 in_use_count==0 时的 non_in_use_errors 分支负责：
+    #   全部都是非占用类错误码才返回未知；只要有一个占用证据就报占用。
+    return True
 
 
 def mic_in_use(conservative=True):
