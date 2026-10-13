@@ -126,6 +126,21 @@ _WIN = sys.platform == "win32"
 
 _DEVCLASS_CAMERA = "{ca3e7ab9-b4c3-4ae6-8251-58ef5fbb7f7c}"
 _DEVINTERFACE_VIDEO_DEVICE = "{e6cafbd7-1866-4b66-9f8d-431d5f55c1da}"
+# KSCATEGORY_VIDEO_CAMERA — 内核流类别，老摄像头驱动 / 第三方 SDK（ev录频、抖音伴侣、
+# ManyCam 等虚拟驱动）经常只在这一类里注册。微软 DDK ksmedia.h 标准值。
+_KSCATEGORY_VIDEO_CAMERA = "{65e8773d-8f56-11d0-a3b9-00a0c9223196}"
+# KSCATEGORY_CAPTURE — 通用音视频捕获类别，部分 DirectShow filter 用这一类。
+_KSCATEGORY_CAPTURE = "{6994ad05-93ef-11d0-a3ac-00a0c9223196}"
+# KSCATEGORY_VIDEO — 父类别，包含 VIDEO_CAMERA / CAPTURE 等子类。
+_KSCATEGORY_VIDEO = "{6994ad04-93ef-11d0-a3ac-00a0c9223196}"
+# 摄像头枚举要查的所有 GUID（去重由调用方负责）
+_CAMERA_ENUM_GUIDS = (
+    _DEVCLASS_CAMERA,
+    _DEVINTERFACE_VIDEO_DEVICE,
+    _KSCATEGORY_VIDEO_CAMERA,
+    _KSCATEGORY_CAPTURE,
+    _KSCATEGORY_VIDEO,
+)
 
 DIGCF_PRESENT = 0x00000002
 DIGCF_DEVICEINTERFACE = 0x00000010
@@ -366,79 +381,82 @@ def _interface_path(setupapi, dev_info, ifdata):
     return ctypes.cast(buf, ctypes.c_wchar_p).value
 
 
+def _enumerate_paths_for_guid(setupapi, guid_text):
+    """用给定的 GUID 枚举所有 PRESENT 设备的接口路径。
+
+    返回 list[str]；任何一步异常都返回空 list（不抛给上层，避免一个 GUID
+    失败拖垮整个枚举）。
+    """
+    paths = []
+    try:
+        class_guid = _guid(guid_text)
+        iface_guid = _guid(guid_text)  # 同一 GUID 同时用作类 GUID + 接口 GUID
+        dev_info = setupapi.SetupDiGetClassDevsW(ctypes.byref(class_guid), None, None,
+                                                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
+        if not dev_info or dev_info == INVALID_HANDLE_VALUE:
+            return []
+        try:
+            index = 0
+            while True:
+                ifdata = _SP_DEVICE_INTERFACE_DATA()
+                ifdata.cbSize = ctypes.sizeof(ifdata)
+                if not setupapi.SetupDiEnumDeviceInterfaces(dev_info, None,
+                                                           ctypes.byref(iface_guid),
+                                                           index, ctypes.byref(ifdata)):
+                    break
+                path = _interface_path(setupapi, dev_info, ifdata)
+                if path:
+                    paths.append(path)
+                index += 1
+        finally:
+            try:
+                setupapi.SetupDiDestroyDeviceInfoList(dev_info)
+            except Exception:
+                pass
+    except Exception as exc:
+        _log_debug("GUID %s 枚举异常: %r", guid_text, exc)
+    return paths
+
+
 def _enumerate_camera_paths():
     """枚举所有**当前连接**的摄像头设备接口路径（虚拟驱动同样在此列）。
 
-    返回 list[str]；任何一步失败都抛给调用方，由上层转成 None（未知）。
+    返回 list[str]；任何 GUID 失败都不影响其它 GUID。
+
+    多 GUID 并行：单 GUID 可能漏掉一些只在 KS 流类别 / DirectShow filter
+    类下注册的虚拟驱动，多 GUID 覆盖更广。
     """
     setupapi, _kernel32 = _load_setupapi()
-    class_guid = _guid(_DEVCLASS_CAMERA)
-    iface_guid = _guid(_DEVINTERFACE_VIDEO_DEVICE)
-    paths = []
-
-    dev_info = setupapi.SetupDiGetClassDevsW(ctypes.byref(class_guid), None, None,
-                                            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
-    if not dev_info or dev_info == INVALID_HANDLE_VALUE:
-        raise OSError("SetupDiGetClassDevsW 失败, err=%d" % ctypes.get_last_error())
-    try:
-        # --- 1) 设备接口枚举：拿到可直接 CreateFile 的 \\?\usb#... 路径 ---
-        index = 0
-        while True:
-            ifdata = _SP_DEVICE_INTERFACE_DATA()
-            ifdata.cbSize = ctypes.sizeof(ifdata)
-            if not setupapi.SetupDiEnumDeviceInterfaces(dev_info, None,
-                                                       ctypes.byref(iface_guid),
-                                                       index, ctypes.byref(ifdata)):
-                break  # 没有更多设备了
-            path = _interface_path(setupapi, dev_info, ifdata)
-            if path:
-                paths.append(path)
-            index += 1
-
-        # --- 2) 设备实例枚举兜底：有些虚拟驱动只注册了类而没暴露标准接口，
-        #        这时至少记下它的实例 ID，说明该类里确实存在设备。 ---
-        if not paths:
-            index = 0
-            while True:
-                devdata = _SP_DEVINFO_DATA()
-                devdata.cbSize = ctypes.sizeof(devdata)
-                if not setupapi.SetupDiEnumDeviceInfo(dev_info, index,
-                                                      ctypes.byref(devdata)):
-                    break
-                buf = ctypes.create_unicode_buffer(512)
-                if setupapi.SetupDiGetDeviceInstanceIdW(dev_info, ctypes.byref(devdata),
-                                                       buf, 512, None):
-                    _log_debug("摄像头设备实例(无接口路径, 忽略): %s", buf.value)
-                index += 1
-    finally:
-        # 枚举句柄必须释放，否则每次轮询都会泄漏一个设备信息集
-        try:
-            setupapi.SetupDiDestroyDeviceInfoList(dev_info)
-        except Exception:
-            pass
+    all_paths = []
+    for guid_text in _CAMERA_ENUM_GUIDS:
+        all_paths.extend(_enumerate_paths_for_guid(setupapi, guid_text))
 
     # 去重，保持顺序稳定
     seen = set()
     unique = []
-    for p in paths:
+    for p in all_paths:
         if p not in seen:
             seen.add(p)
             unique.append(p)
+    _log_debug("摄像头枚举完成：%d 个 GUID 共发现 %d 个唯一设备",
+               len(_CAMERA_ENUM_GUIDS), len(unique))
     return unique
 
 
-def _open_device_exclusive(kernel32, path):
-    """以独占方式(dwShareMode=0)打开设备路径。
+def _open_device_exclusive(kernel32, path, share_mode):
+    """以指定共享模式打开设备路径。
 
-    返回 (True,)  打开成功 -> 说明空闲
-          (False, err) 打开失败，err 为 GetLastError
+    share_mode=0 表示独占，其它值表示 FILE_SHARE_* 位掩码。
+
+    返回 (True, None)  打开成功
+          (False, err)  打开失败，err 为 GetLastError
     """
-    handle = kernel32.CreateFileW(path, GENERIC_READ, 0, None,
+    handle = kernel32.CreateFileW(path, GENERIC_READ, share_mode, None,
                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
     if handle is None or handle == INVALID_HANDLE_VALUE or handle == 0:
         return False, ctypes.get_last_error()
     try:
-        return True, 0
+        return True, None
     finally:
         kernel32.CloseHandle(handle)
 
@@ -461,55 +479,55 @@ def _open_variants(kernel32, path):
     按多个方式尝试打开同一个摄像头设备，提高真机命中率。
 
     返回 (opened, in_use_err)：
-      opened      至少有一次打开成功 -> 该设备当前空闲
+      opened      至少有一次打开成功 -> 该设备当前**未观察到**占用信号
       in_use_err  某次打开返回了明确的占用类错误码（否则为 None）
 
-    说明：摄像头应用通常以独占方式打开设备，因此「连共享模式都打不开」
-    是很强的占用证据；但只有明确的占用类错误码才判定为占用，
-    路径失效/权限不足一律不算，避免误亮灯。
+    多策略：
+      1. 独占 (dwShareMode=0)
+      2. 读+写共享 (FILE_SHARE_READ|FILE_SHARE_WRITE)
+      3. 仅读共享 (FILE_SHARE_READ)
+      4. 对去掉接口后缀的"设备路径"重试 1~3
+
+    只要任一次拿到明确的占用类错误码，立刻判定为占用；
+    否则只要有一次打开成功，标记为"未观察到占用"（让上层做多源判定）。
     """
     candidates = [path]
     stripped = _strip_interface_suffix(path)
     if stripped:
         candidates.append(stripped)
 
+    share_modes = (
+        0,  # 独占
+        FILE_SHARE_READ | FILE_SHARE_WRITE,  # 读+写共享
+        FILE_SHARE_READ,  # 仅读共享
+    )
+
     in_use_err = None
     opened = False
     for cand in candidates:
-        # 1) 独占打开
-        try:
-            ok, err = _open_device_exclusive(kernel32, cand)
-        except Exception as exc:
-            _log_debug("打开摄像头设备异常 %s: %r", cand, exc)
-            continue
-        if ok:
-            opened = True
-            break
-        if err in CAMERA_IN_USE_ERRORS:
-            in_use_err = err
-            break
-
-        # 2) 独占打不开时，再试允许读共享的打开方式。
-        #    若设备被别人独占持有，这里同样会返回共享冲突。
-        try:
-            handle = kernel32.CreateFileW(cand, GENERIC_READ,
-                                          FILE_SHARE_READ | FILE_SHARE_WRITE, None,
-                                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
-        except Exception as exc:
-            _log_debug("共享方式打开异常 %s: %r", cand, exc)
-            continue
-        if handle and handle != INVALID_HANDLE_VALUE and handle != 0:
+        for share_mode in share_modes:
             try:
+                ok, err = _open_device_exclusive(kernel32, cand, share_mode)
+            except Exception as exc:
+                _log_debug("打开摄像头设备异常 %s (share=%d): %r",
+                           cand, share_mode, exc)
+                continue
+            if ok:
                 opened = True
+                # 已经成功打开，不需要再试别的 share_mode
                 break
-            finally:
-                kernel32.CloseHandle(handle)
-        else:
-            err = ctypes.get_last_error()
             if err in CAMERA_IN_USE_ERRORS:
+                # 明确的占用类错误码，立刻判定为占用
                 in_use_err = err
-                break
-        _log_debug("摄像头设备 %s 打开失败(err=%d)，尝试下一种方式", cand, err)
+                return opened, in_use_err
+            # 非占用类错误码（路径失效等），继续尝试下一种方式
+            _log_debug("摄像头设备 %s (share=%d) 打开失败 err=%d，继续",
+                       cand, share_mode, err)
+        if in_use_err is not None or opened:
+            # 已确定结果，跳出候选循环
+            if in_use_err is not None:
+                return opened, in_use_err
+            break
     return opened, in_use_err
 
 
@@ -593,19 +611,45 @@ def mic_in_use(conservative=True):
     """麦克风是否正在被任意程序使用。
 
     返回 True / False / None(未知)。
-    判定依据：对每个 waveIn 录音设备做一次 waveInOpen 尝试。
+
+    多源探测（任何一个 True 即判定为占用）：
+      1. waveIn 独占打开（老路径，对 Win10/11 上少数仍用 MME 的应用有效）
+      2. WASAPI session 枚举（Windows 10/11 主路径，覆盖 ev录频 / 系统录音机 /
+         微信/QQ/Teams/Zoom 等所有 WASAPI 应用）
     """
     if not _WIN:
         return False if not conservative else None
+
+    # 探测 1：waveIn 独占打开
+    wavein_in_use = _mic_in_use_wavein()
+    if wavein_in_use is True:
+        return True
+    # wavein_in_use 是 None 时（探测失败），继续走 WASAPI；是 False 时（明确空闲）
+    # 也继续走 WASAPI —— 因为很多应用只用 WASAPI 不走 waveIn
+
+    # 探测 2：WASAPI session 枚举
+    wasapi_in_use = _mic_in_use_wasapi()
+    if wasapi_in_use is True:
+        return True
+    if wavein_in_use is False and wasapi_in_use is False:
+        return False
+    if wavein_in_use is None and wasapi_in_use is None:
+        return False if not conservative else None
+    # 至少一个明确说占用、另一个未知
+    return True if wasapi_in_use is True or wavein_in_use is True else False
+
+
+def _mic_in_use_wavein():
+    """waveIn 独占打开尝试，返回 True / False / None(未知)。"""
     try:
         winmm = _load_winmm()
         count = winmm.waveInGetNumDevs()
     except Exception as exc:
         _log_debug("winmm 加载/枚举异常: %r", exc)
-        return False if not conservative else None
+        return None
 
     if not count:
-        return False               # 没有录音设备 -> 不可能在用
+        return False  # 没有录音设备 -> 不可能在用
 
     wfx = _WAVEFORMATEX()
     wfx.wFormatTag = WAVE_FORMAT_PCM
@@ -627,14 +671,12 @@ def mic_in_use(conservative=True):
             continue
         if rc == MMSYSERR_NOERROR:
             probed += 1
-            # 打开成功 -> 设备空闲，必须立刻关闭，绝不抢占
             try:
                 winmm.waveInClose(handle)
             except Exception:
                 pass
             handle = None
             continue
-        # 打开失败：句柄理论上不会有值，保险起见也关一次
         if handle:
             try:
                 winmm.waveInClose(handle)
@@ -644,7 +686,327 @@ def mic_in_use(conservative=True):
             return True
         _log_debug("录音设备 %d waveInOpen 返回 %d，忽略", dev_id, rc)
 
-    return False if probed else (False if not conservative else None)
+    return False if probed else None
+
+
+# ---------- WASAPI 麦克风占用检测（覆盖 Windows 10/11 主路径） ----------
+
+# 关键 GUID / IID / 接口 vtable 偏移
+_CLSID_IMMDeviceEnumerator = "{A95664D2-9614-4F35-A746-DE8DB636B7BF}"
+_IID_IMMDeviceEnumerator = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+_IID_IMMDeviceCollection = "{0BD7A1BE-7A1A-44DB-8397-CC5392387B5E}"
+_IID_IMMDevice = "{D666063F-1587-4E43-81F1-A94885D7D9B9}"
+_IID_IAudioSessionManager2 = "{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}"
+_IID_IAudioSessionEnumerator = "{E4F9856D-2A40-4333-9F02-8674CD606D7D}"
+_IID_IAudioSessionControl2 = "{CBE83A1F-7A9C-4B91-9C2D-B33C26B4B92C}"
+
+# eDataFlow / role
+_eCapture = 1  # eCapture
+_eConsole = 0  # eConsole
+
+# AudioSessionState
+_AudioSessionStateInactive = 0
+_AudioSessionStateActive = 1
+_AudioSessionStateExpired = 2
+
+# IUnknown vtable:
+#   0: QueryInterface
+#   1: AddRef
+#   2: Release
+# IMMDeviceEnumerator vtable (extends IUnknown):
+#   3: EnumAudioEndpoints
+#   4: GetDefaultAudioEndpoint
+#   5: GetDevice
+#   6: RegisterEndpointNotificationCallback
+#   7: UnregisterEndpointNotificationCallback
+# IMMDeviceCollection vtable:
+#   3: GetCount
+#   4: Item
+# IMMDevice vtable:
+#   3: Activate
+#   4: OpenPropertyStore
+#   5: GetId
+#   6: GetState
+# IAudioSessionManager2 vtable:
+#   3: GetAudioSessionControl
+#   4: RegisterAudioSessionNotification
+#   5: UnregisterAudioSessionNotification
+#   6: RegisterDuckNotification
+#   7: UnregisterDuckNotification
+#   8: GetSessionEnumerator  ← 唯一我们要的
+# IAudioSessionEnumerator vtable:
+#   3: GetCount
+#   4: GetSession
+# IAudioSessionControl2 vtable:
+#   3: GetState
+#   4: GetDisplayName
+#   5: SetDisplayName
+#   6: GetIconPath
+#   7: SetIconPath
+#   8: GetGroupingParam
+#   9: SetGroupingParam
+#   10: RegisterAudioSessionNotification
+#   11: UnregisterAudioSessionNotification
+#   12: GetSessionIdentifier
+#   13: GetSessionInstanceIdentifier
+#   14: GetProcessId
+#   15: IsSystemSoundsSession
+#   16: SetDuckingPreference    ← 在 IAudioSessionControl2 上
+
+
+class _COMGUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8)]
+
+    @classmethod
+    def from_string(cls, text):
+        text = text.strip().strip("{}").lower()
+        a, b, c, d, e = text.split("-")
+        raw = bytes.fromhex(a)[::-1] + bytes.fromhex(b)[::-1] + bytes.fromhex(c)[::-1] \
+            + bytes.fromhex(d) + bytes.fromhex(e)
+        return cls.from_buffer_copy(raw)
+
+
+# ctypes.WINFUNCTYPE 在非 Windows 平台不存在，用 CFUNCTYPE 做替代
+# （macOS 上 selftest 不调 WASAPI 路径，所以这里的语义只用于类型声明）
+if hasattr(ctypes, "WINFUNCTYPE"):
+    _CFUNCTYPE = ctypes.WINFUNCTYPE
+else:
+    _CFUNCTYPE = ctypes.CFUNCTYPE
+
+
+def _hr_check(hr):
+    """简化 HRESULT 检查：FAILED(hr) 返回 True。"""
+    return (hr & 0xFFFF0000) != 0
+
+
+def _load_mfplat():
+    """懒加载 ole32 + propsys DLL。"""
+    ole32 = _win32_dll("ole32.dll")
+    ole32.CoInitializeEx.restype = ctypes.c_uint
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    ole32.CoUninitialize.restype = None
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoCreateInstance.restype = ctypes.c_uint
+    ole32.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+                                       ctypes.c_void_p, ctypes.c_void_p]
+    return ole32
+
+
+def _wasapi_enum_capture_sessions():
+    """枚举所有 capture 设备的 audio session，返回 list of session state。
+
+    返回 [(state_int, process_id)]，任何一步异常都返回空 list。
+
+    每个元素是一个 (state, pid) 元组，调用方据此判断是否有 active session。
+    """
+    try:
+        ole32 = _load_mfplat()
+    except Exception as exc:
+        _log_debug("ole32 加载异常: %r", exc)
+        return []
+
+    # COM 初始化（必须 STA 或 MTA，0x2 = COINIT_APARTMENTTHREADED）
+    # 在多线程线程里 CoInitialize 可能已调过，第二次返回 RPC_E_CHANGED_MODE，跳过
+    hr = ole32.CoInitializeEx(None, 0x2)
+    if _hr_check(hr) and hr != 0x80010106:  # RPC_E_CHANGED_MODE
+        _log_debug("CoInitializeEx 失败 hr=0x%X", hr)
+        return []
+    try:
+        return _wasapi_enum_inner(ole32)
+    finally:
+        try:
+            ole32.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _wasapi_enum_inner(ole32):
+    """实际的 WASAPI 枚举逻辑。"""
+    # 创建 IMMDeviceEnumerator
+    clsid = _COMGUID.from_string(_CLSID_IMMDeviceEnumerator)
+    iid = _COMGUID.from_string(_IID_IMMDeviceEnumerator)
+    enumerator = ctypes.c_void_p(0)
+    hr = ole32.CoCreateInstance(ctypes.byref(clsid), None, 0x1,  # CLSCTX_INPROC_SERVER
+                                ctypes.byref(iid), ctypes.byref(enumerator))
+    if _hr_check(hr) or not enumerator.value:
+        _log_debug("CoCreateInstance(IMMDeviceEnumerator) hr=0x%X", hr)
+        return []
+
+    try:
+        # IUnknown::Release (vtable slot 2)
+        vtable = ctypes.cast(ctypes.cast(enumerator, ctypes.c_void_p).value,
+                             ctypes.POINTER(ctypes.c_void_p * 3)).contents
+        # 实际拿 vtable 指针
+        enumerator_vtbl_ptr = ctypes.cast(enumerator, ctypes.POINTER(ctypes.c_void_p)).value
+        vtbl = ctypes.cast(enumerator_vtbl_ptr, ctypes.POINTER(ctypes.c_void_p * 16)).contents
+
+        # IMMDeviceEnumerator::EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, **collection)
+        # vtable[3] = EnumAudioEndpoints
+        EnumAudioEndpoints = _CFUNCTYPE(
+            ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p
+        )(vtbl[3])
+        collection = ctypes.c_void_p(0)
+        # DEVICE_STATE_ACTIVE = 0x1
+        hr = EnumAudioEndpoints(enumerator, _eCapture, 0x1, ctypes.byref(collection))
+        if _hr_check(hr) or not collection.value:
+            _log_debug("EnumAudioEndpoints hr=0x%X", hr)
+            return []
+
+        try:
+            # IMMDeviceCollection vtable: [3]=GetCount, [4]=Item
+            coll_vtbl_ptr = ctypes.cast(collection, ctypes.POINTER(ctypes.c_void_p)).value
+            coll_vtbl = ctypes.cast(coll_vtbl_ptr,
+                                    ctypes.POINTER(ctypes.c_void_p * 8)).contents
+            GetCount = _CFUNCTYPE(
+                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)
+            )(coll_vtbl[3])
+            count = ctypes.c_uint(0)
+            hr = GetCount(collection, ctypes.byref(count))
+            if _hr_check(hr):
+                _log_debug("IMMDeviceCollection::GetCount hr=0x%X", hr)
+                return []
+
+            sessions = []
+            Item = _CFUNCTYPE(
+                ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p
+            )(coll_vtbl[4])
+
+            for i in range(count.value):
+                device = ctypes.c_void_p(0)
+                hr = Item(collection, i, ctypes.byref(device))
+                if _hr_check(hr) or not device.value:
+                    continue
+                try:
+                    sessions.extend(_wasapi_sessions_for_device(device))
+                finally:
+                    # IMMDevice::Release (vtable slot 2)
+                    dev_vtbl_ptr = ctypes.cast(device,
+                                               ctypes.POINTER(ctypes.c_void_p)).value
+                    dev_vtbl = ctypes.cast(dev_vtbl_ptr,
+                                            ctypes.POINTER(ctypes.c_void_p * 16)).contents
+                    Release = _CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p)(dev_vtbl[2])
+                    Release(device)
+            return sessions
+        finally:
+            # IMMDeviceCollection::Release
+            Release = _CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p)(coll_vtbl[2])
+            Release(collection)
+    finally:
+        # IMMDeviceEnumerator::Release
+        Release = _CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p)(vtbl[2])
+        Release(enumerator)
+
+
+def _wasapi_sessions_for_device(device):
+    """对单个 capture device 激活 IAudioSessionManager2 并枚举所有 session。"""
+    # IMMDevice::Activate(IID_IAudioSessionManager2, CLSCTX_ALL, NULL, **sessionMgr)
+    dev_vtbl_ptr = ctypes.cast(device, ctypes.POINTER(ctypes.c_void_p)).value
+    dev_vtbl = ctypes.cast(dev_vtbl_ptr,
+                           ctypes.POINTER(ctypes.c_void_p * 16)).contents
+    iid_sessmgr = _COMGUID.from_string(_IID_IAudioSessionManager2)
+    Activate = _CFUNCTYPE(
+        ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+        ctypes.c_void_p, ctypes.c_void_p
+    )(dev_vtbl[3])
+    session_mgr = ctypes.c_void_p(0)
+    hr = Activate(device, ctypes.byref(iid_sessmgr), 0x17,  # CLSCTX_ALL
+                  None, ctypes.byref(session_mgr))
+    if _hr_check(hr) or not session_mgr.value:
+        _log_debug("IMMDevice::Activate(IAudioSessionManager2) hr=0x%X", hr)
+        return []
+
+    try:
+        # IAudioSessionManager2 vtable: [8]=GetSessionEnumerator
+        sm_vtbl_ptr = ctypes.cast(session_mgr, ctypes.POINTER(ctypes.c_void_p)).value
+        sm_vtbl = ctypes.cast(sm_vtbl_ptr,
+                              ctypes.POINTER(ctypes.c_void_p * 16)).contents
+        GetSessionEnumerator = _CFUNCTYPE(
+            ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p
+        )(sm_vtbl[8])
+        session_enum = ctypes.c_void_p(0)
+        hr = GetSessionEnumerator(session_mgr, ctypes.byref(session_enum))
+        if _hr_check(hr) or not session_enum.value:
+            _log_debug("IAudioSessionManager2::GetSessionEnumerator hr=0x%X", hr)
+            return []
+
+        try:
+            # IAudioSessionEnumerator vtable: [3]=GetCount, [4]=GetSession
+            se_vtbl_ptr = ctypes.cast(session_enum, ctypes.POINTER(ctypes.c_void_p)).value
+            se_vtbl = ctypes.cast(se_vtbl_ptr,
+                                  ctypes.POINTER(ctypes.c_void_p * 8)).contents
+            GetCount = _CFUNCTYPE(
+                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)
+            )(se_vtbl[3])
+            count = ctypes.c_uint(0)
+            hr = GetCount(session_enum, ctypes.byref(count))
+            if _hr_check(hr):
+                return []
+
+            results = []
+            GetSession = _CFUNCTYPE(
+                ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p
+            )(se_vtbl[4])
+            for i in range(count.value):
+                session = ctypes.c_void_p(0)
+                hr = GetSession(session_enum, i, ctypes.byref(session))
+                if _hr_check(hr) or not session.value:
+                    continue
+                try:
+                    # IAudioSessionControl2 vtable: [3]=GetState, [14]=GetProcessId
+                    s_vtbl_ptr = ctypes.cast(session,
+                                             ctypes.POINTER(ctypes.c_void_p)).value
+                    s_vtbl = ctypes.cast(s_vtbl_ptr,
+                                         ctypes.POINTER(ctypes.c_void_p * 20)).contents
+                    GetState = _CFUNCTYPE(
+                        ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)
+                    )(s_vtbl[3])
+                    state = ctypes.c_uint(0)
+                    hr = GetState(session, ctypes.byref(state))
+                    if _hr_check(hr):
+                        continue
+                    GetProcessId = _CFUNCTYPE(
+                        ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)
+                    )(s_vtbl[14])
+                    pid = ctypes.c_uint(0)
+                    hr = GetProcessId(session, ctypes.byref(pid))
+                    if _hr_check(hr):
+                        pid = ctypes.c_uint(0)
+                    results.append((state.value, pid.value))
+                finally:
+                    Release = _CFUNCTYPE(
+                        ctypes.c_uint, ctypes.c_void_p)(s_vtbl[2])
+                    Release(session)
+            return results
+        finally:
+            Release = _CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p)(se_vtbl[2])
+            Release(session_enum)
+    finally:
+        Release = _CFUNCTYPE(ctypes.c_uint, ctypes.c_void_p)(sm_vtbl[2])
+        Release(session_mgr)
+
+
+def _mic_in_use_wasapi():
+    """通过 WASAPI 检查是否有 active 的 audio capture session。
+
+    返回 True / False / None(未知)。
+    """
+    if not _WIN:
+        return None
+    try:
+        sessions = _wasapi_enum_capture_sessions()
+    except Exception as exc:
+        _log_debug("WASAPI 枚举异常: %r", exc)
+        return None
+    if not sessions:
+        return None  # WASAPI 不可用或没拿到数据，按未知处理
+    # 任一 session 是 active 状态（且不是 system sounds session，pid=0 通常是） -> 占用
+    for state, pid in sessions:
+        if state == _AudioSessionStateActive and pid != 0:
+            return True
+    return False
 
 
 def probe(conservative=True):

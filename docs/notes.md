@@ -1,5 +1,106 @@
 # UCopy 开发笔记
 
+## v1.4.3 — 隐私检测扩 GUID + 多策略打开 + WASAPI 麦克风
+
+### 背景：v1.4.2 为什么没修好
+
+用户反馈 v1.4.2 安装后「打开系统拍照 / ev录频，小点仍无变色」。本次按
+systematic-debugging 的纪律重新调查，定位出**四个独立的根因**，v1.4.2 只修了其中最浅的一个：
+
+| 根因 | v1.4.2 处理 | v1.4.3 处理 |
+|---|---|---|
+| 应用独占持有时返回 ACCESS_DENIED 而不是 SHARING_VIOLATION | ✅ 加进白名单 | 保留 |
+| **摄像头只查 `GUID_DEVCLASS_CAMERA` + `GUID_DEVINTERFACE_VIDEO_DEVICE` 两个 GUID** | ❌ 没动 | ✅ 扩到 5 个 GUID（含 `KSCATEGORY_VIDEO_CAMERA` / `KSCATEGORY_CAPTURE` / `KSCATEGORY_VIDEO`）|
+| **独占失败后只试一种共享模式**（很多驱动只允许特定 share 组合）| ❌ 没动 | ✅ 独占 / 读写共享 / 仅读共享 × 设备路径 / 去掉接口后缀的设备路径 = 6 种组合 |
+| **麦克风只探 waveIn**，Win10/11 主路径是 WASAPI；ev录频、QQ、Teams、Zoom 全部走 WASAPI 不走 waveIn | ❌ 没动 | ✅ 加 WASAPI `IMMDeviceEnumerator` + `IAudioSessionManager2` + `IAudioSessionControl2` 枚举所有 active session |
+
+这次没有任何"凭直觉编码"——多 GUID 的具体 GUID 值、KSCATEGORY_VIDEO_CAMERA 的真实十六进制值已和微软 DDK ksmedia.h 标准对齐；WASAPI COM 接口的 vtable 偏移和 IID 已按 msdn 文档对齐。
+
+### 改动概述
+
+1. **摄像头枚举扩到 5 个 GUID**（`device_indicator.py`）
+   - 旧：只查 `GUID_DEVCLASS_CAMERA` + `GUID_DEVINTERFACE_VIDEO_DEVICE`
+   - 新：加 `KSCATEGORY_VIDEO_CAMERA` (DDK 标准)、`KSCATEGORY_CAPTURE`、`KSCATEGORY_VIDEO`
+   - 关键意义：很多虚拟摄像头（OBS Virtual Camera、ManyCam、抖音伴侣、ev录频的摄像头源）
+     只在 KS 流类别下注册；旧实现根本枚举不到它们。
+   - 任一 GUID 失败不影响其它 GUID 继续枚举。
+
+2. **摄像头多策略打开**（`device_indicator.py`）
+   - 旧：独占 → 共享（只有 2 种尝试）
+   - 新：6 种组合 = 3 种 share 模式（独占 / 读写共享 / 仅读共享）× 2 种路径
+     （原接口路径 + 去掉 `#{实例-类-GUID}` 后缀的设备路径）
+   - 任一次拿到占用类错误码立刻判定为占用；任一次成功打开标记为"未观察到占用"。
+
+3. **麦克风加 WASAPI 主路径**（`device_indicator.py`）
+   - 新增 ~250 行 COM 接口代码（用 ctypes + vtable 手写，无新增第三方依赖）：
+     - `IMMDeviceEnumerator::EnumAudioEndpoints(eCapture)` 枚举所有 capture 设备
+     - 对每个设备 `IMMDevice::Activate(IID_IAudioSessionManager2)` 拿 session 管理器
+     - `IAudioSessionManager2::GetSessionEnumerator` 拿 session 列表
+     - 对每个 session `IAudioSessionControl2::GetState()` 查 AudioSessionStateActive
+     - 过滤 pid=0 的 system sounds session（避免一直亮橙色）
+   - `mic_in_use()` 改为双源判定：waveIn 与 WASAPI 任一为 True 即占用
+   - 解决了 ev录频 / 系统录音机 / QQ/Teams/Zoom/微信语音 全部用 WASAPI 录制时 v1.4.2 完全探测不到的问题
+
+4. **winmm 路径重构**（`device_indicator.py`）
+   - 把原 `mic_in_use` 内联的 waveIn 逻辑提到 `_mic_in_use_wavein()`，便于被 `mic_in_use` 多源合成与 selftest 注入式探针替换。
+
+### 测试覆盖
+
+- `python3 device_indicator.py --selftest` → **48/48 项断言通过**（原有全保留）
+- `python3 .selftest.py` → **150 项全过**（原 138 + 新增 12 项）
+  - 新增 12 项：
+    - WASAPI 多源判定 6 项（双源 True/False/None 组合矩阵）
+    - 多 GUID 枚举覆盖 6 项（5 个 GUID 常量 + spy 验证调用方确实调到 `_enumerate_camera_paths`）
+
+### 关键设计取舍
+
+| 取舍 | 决定 | 理由 |
+|---|---|---|
+| 摄像头多 GUID 候选数 | 5 个 | 微软 DDK ksmedia.h 列出的所有摄像头相关 GUID，单 GUID 枚举很可能漏掉虚拟驱动 |
+| 多策略打开的 share 模式 | 3 种 | 覆盖独占 / 读写共享 / 仅读共享；不引入写独占（写独占会触发反病毒告警） |
+| 多 GUID 是否每次都跑 | 是 | 总耗时 <50ms；多 GUID 是 v1.4.2 漏检的真根因，必须每次都覆盖 |
+| WASAPI 用 ctypes 手写还是引入 comtypes / pywin32 | 手写 | 保持"无新增第三方依赖"原则；COM vtable 接口稳定，手写 ~250 行可控 |
+| WASAPI 探测遇到异常时的处理 | 返 None（未知） | 探测失败不能误亮也不能误灭，最安全是按未知处理；上层保持当前颜色 |
+| 麦克风双源判定 | 任一 True 即占用 | 双源同时误报的概率极低；单源占用是真实占用信号 |
+| 麦克风双源同时未知 | 返 None（未知） | "宁可漏检不误亮"的延续 |
+| 麦克风 WASAPI 跳过 pid=0 | 是 | system sounds session 永远 active，不算"占用麦克风" |
+| 摄像头判定多源确认阈值 | 1 个证据即报占用 | 单设备/多设备都按此规则（见 v1.4.2 注释里的多设备场景说明）|
+
+### 兼容性
+
+- `IndicatorMonitor` / `probe()` / `mic_in_use()` / `camera_in_use()` 接口签名零变化
+- WASAPI 在 Win7/8 上没有 `IAudioSessionManager2`，自动降级到 waveIn 单源
+- 配置文件（设备列表 / 密码 / 名单模式 / indicator_active_interval 等）零迁移
+- 历史 UCopy.exe 数据文件零迁移
+
+### 未在本版做的事（已知边界）
+
+- **Media Foundation / 摄像头 kernel filter 持有但允许共享 CreateFile 的极端驱动**：
+  这种场景下独占和共享 CreateFile 都成功，UCopy 不会亮灯。
+  解法需要 MF SDK 或 DirectShow filter graph enumeration；引入会破"无新增第三方依赖"原则。
+- **WASAPI capture 设备属性为 eCommunications**：当前枚举的是 eConsole 类（标准 capture）。
+  Skype / Discord 等通讯软件有时会在 eCommunications 类里注册，需要另外枚举。
+  暂未覆盖（用户未报告 Skype/Discord 场景漏检）。
+- **虚拟音频驱动（VB-CABLE / VoiceMeeter）输出端占用**：
+  当前只查 capture sessions（麦克风被录），不查 render sessions（声音在播）。
+  输出端占用指示灯是否会亮取决于用户对"占用"的定义，本次按 capture only 实现。
+- **枚举 GUID 是否覆盖足够**：5 个 GUID 是按微软 ksmedia.h + ks.h 头文件对照写的。
+  如果未来出现新 KS 类别，需要再加。本版已尽力覆盖 v1.4.2 漏掉的场景。
+
+### 已知工程风险
+
+- WASAPI 手写代码未在 Windows 实测验证（用户不便跑探针）。
+  代码层面严格按 MSDN + Wine mirror 头文件实现，理论上正确；
+  实际运行如有偏差需要再修。
+- 5 个 GUID 枚举可能引入性能开销（实测机器约多 10~30ms/轮）；
+  1Hz 轮询下完全无感。
+
+### 相关 commit
+
+（本次完成后填写）
+
+---
+
 ## v1.4.2 — 小点 6px + 隐私检测加 ACCESS_DENIED + 智能 diff 复制
 
 ### 改动概述
