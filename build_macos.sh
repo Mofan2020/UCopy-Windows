@@ -25,10 +25,20 @@ if [[ "$(uname)" != "Darwin" ]]; then
     exit 1
 fi
 
-PYTHON="${PYTHON:-/opt/anaconda3/bin/python}"
-if [[ ! -x "$PYTHON" ]]; then
-    echo "ERROR: 找不到 python3 ($PYTHON)" >&2
-    echo "       改成你自己的路径或在 conda base 里装 pyinstaller" >&2
+# Python 解析顺序：
+#   1. $PYTHON 环境变量（CI 可设）
+#   2. /opt/anaconda3/bin/python（本地 mac dev 机器常用位置）
+#   3. python3（PATH 上的任意 python；CI 必走这条）
+PYTHON="${PYTHON:-}"
+if [[ -z "$PYTHON" ]] && [[ -x /opt/anaconda3/bin/python ]]; then
+    PYTHON=/opt/anaconda3/bin/python
+fi
+if [[ -z "$PYTHON" ]]; then
+    PYTHON="$(command -v python3)"
+fi
+if [[ -z "$PYTHON" ]] || [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: 找不到 python3" >&2
+    echo "       设 PYTHON=/path/to/python3 或装 pyinstaller" >&2
     exit 1
 fi
 
