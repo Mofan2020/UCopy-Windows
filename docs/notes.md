@@ -285,7 +285,14 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
    - `config.py` 服务器配置（监听端口 / 数据目录 / 初始管理员）。
    - `static/index.html` 简单 Web GUI（登录 + 用户管理 + launchd 开关 + 文件浏览 + 配置 JSON 编辑）。
 
-3. **`ucopy.py` 集成**：
+3. **macOS 服务器单文件打包**（PyInstaller `--onefile`）：
+   - `build_macos.sh`：本地构建脚本（默认 arm64；`TARGET_ARCH=x86_64` 切 Intel；`UNIVERSAL=1` 通用二进制）
+   - `.github/workflows/build-server.yml`：CI 在 macos-14 上跑矩阵构建（arm64 + x86_64）+ 产物上 Release
+   - 产物名约定：`UCopy-Server-macos-arm64` / `UCopy-Server-macos-x86_64`（带执行权限）
+   - 端到端验证：打包后二进制 9.5MB，跑 `--help` / 实跑 + curl `/api/v1/ping` / 与 remote_client 完整流程（login/push_config/upload/list/download/unchanged/delete）全部通过
+   - **关键 fix**：模块内 `import db as _db` 等相对 import 在 PyInstaller onefile 下失败，改为 `from . import db as _db`（带 try 兜底兼容源码运行）
+
+4. **`ucopy.py` 集成**：
    - `DEFAULT_CONFIG` 新增 `remote` 段（enabled / server_url / username / auto_upload / trusted_fingerprint / last_error / last_upload_at / last_config_sync_at）。
    - `get_config()` 加 remote 段类型归一化。
    - `RemoteUploader` 后台守护线程：从 queue 拿任务 → `RemoteClient` 上传。先 sha256 check 再 upload（服务端返回 200 / unchanged 短路）。
@@ -298,12 +305,12 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
    - 密码**绝不存盘**，每次 UI 输入后注入到 `UCopyApp._remote_password`（会话级）。
    - `UCopyApp.quit_app` 退出时 `remote_uploader.stop()` 干净停。
 
-4. **mac 自启动管理（服务器侧）**：
+5. **mac 自启动管理（服务器侧）**：
    - 服务器首次启动在 macOS 上自动注册 launchd plist 到 `~/Library/LaunchAgents/com.skyc8266.ucopy-server.plist`。
    - Web GUI "launchd 自启动" 按钮可手动 install / uninstall。
    - Linux 上全 no-op。
 
-5. **摄像头/麦克风隐私检测**：**未做改动**，保持 v1.4.3 实现。漏检场景（kernel filter driver / 三种 share_mode 全 SUCCESS）超出范围，按用户原话"修不了就算了"，写进已知边界。
+6. **摄像头/麦克风隐私检测**：**未做改动**，保持 v1.4.3 实现。漏检场景（kernel filter driver / 三种 share_mode 全 SUCCESS）超出范围，按用户原话"修不了就算了"，写进已知边界。
 
 ### 测试覆盖
 
@@ -315,7 +322,9 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
   - DEFAULT_CONFIG.remote 字段完整性（8 项）
   - RemoteConsentWindow 三项 checkbox（1 项）
   - RemoteUploader 类存在 + 关键方法（6 项）
-- 端到端联调（手动）：server 启动 + login + push_config（密码已脱敏）+ upload + sha256 check + list + download + 重复 upload（unchanged 短路）+ delete 全部跑通。
+- 端到端联调（手动）：源码版 server + client 全流程跑通
+- **打包版端到端联调（手动）**：用 PyInstaller onefile 产出的 `dist/ucopy-server` 跑 + `remote_client.py` 客户端全流程再跑一次，全部通过
+- CI smoke test：`.github/workflows/build-server.yml` 在 macos-14 跑 `--help` + 实跑 + `curl /api/v1/ping` 双重冒烟
 
 ### 关键设计取舍
 
@@ -332,6 +341,8 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
 | 自启动 | macOS launchd + Linux no-op | 用户要求 macOS 专属功能；Windows 用户不需要（UCopy 自带注册表自启动） |
 | 服务器摄像头指纹 | 仅存 SHA-256 DER hex | 非密码，可本地存；指纹变更要求重新信任 + 重输密码 |
 | 服务器 GUI | 纯 HTML/JS 单文件 | 不引前端框架；Web GUI 在 static/index.html |
+| **macOS 服务器打包** | **PyInstaller `--onefile` + arm64+x86_64 双矩阵** | 单文件直接跑；universal binary 通过 lipo 合并；CI 自动 matrix 构建 |
+| **macOS 打包相对 import 兼容** | **`from . import db` + try 兜底为 `import db`** | onefile 模式下 sys.path 不含当前目录；源码跑用相对 import 仍兼容 |
 
 ### 兼容性
 
@@ -339,6 +350,7 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
 - 服务器配置 `~/UCopyServer/server.json` 缺 `initial_admin.password` 时首次启动随机生成并**打印到终端**（用户必须从终端看，不能从 Web GUI）。
 - 服务器 `data_dir/files/<username>/<rel_path>`：admin / user / readonly 各有自己根目录。
 - 历史 UCopy.exe 配置文件零迁移（remote 段可选填）。
+- 打包服务器兼容 macOS 10.15+（PyInstaller 6.x 最低支持版本），**不兼容 Windows / Linux**（那是源代码运行的事）。
 
 ### 未在本版做的事（已知边界）
 
@@ -346,7 +358,4 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
 - **客户端 sha256 缓存**：每次上传前都重算 sha256（~100MB/s，无 IO 瓶颈但 CPU 浪费）。可后续加 file_hash_cache。
 - **服务端媒体预览**：Web GUI 文件列表不显示缩略图 / 视频预览（raw video / mp4 不在范围内）。
 - **摄像头/麦克风检测改进**：kernel filter driver 漏检（pitfall #17）未处理，超出范围；按用户原话"修不了就算了，一切问题都怪微软！"。
-
-### 相关 commit
-
-（本次完成后填写）
+- **macOS 通用二进制**：默认分两个 arch 上传（用户按机器下载），未默认打 universal（体积 ~19MB）。如需打可跑 `UNIVERSAL=1 bash build_macos.sh`。

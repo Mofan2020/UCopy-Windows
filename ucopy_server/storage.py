@@ -131,8 +131,16 @@ def remove_path(path: str) -> None:
 
 def quota_exceeded_for(conn, username: str, additional_bytes: int,
                        quota_mb: int) -> bool:
-    """判断追加 additional_bytes 后是否超 quota_mb。quota_mb == 0 表示不限。"""
-    import db as _db
+    """判断追加 additional_bytes 后是否超 quota_mb。quota_mb == 0 表示不限。
+
+    注意：必须走 from . import db 而不是 import db as _db —— PyInstaller onefile
+    打包后 sys.path 上没有当前目录，相对 import 才走得通。
+    """
+    try:
+        from . import db as _db
+    except ImportError:
+        # 直接 python3 ucopy_server/server.py 跑时也兼容
+        import db as _db
     if quota_mb <= 0:
         return False  # 不限
     used = _db.user_total_size(conn, username)

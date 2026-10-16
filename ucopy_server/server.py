@@ -751,7 +751,9 @@ def run():
         level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
-    import config as server_config
+    # PyInstaller onefile 打包后 sys.path 上没有当前目录；
+    # 显式 import 走 ucopy_server 包，避免 'No module named config'。
+    from ucopy_server import config as server_config
     args = server_config.parse_args()
     cfg = server_config.load_or_init(
         args.data_dir or server_config.DEFAULT_DATA_DIR
