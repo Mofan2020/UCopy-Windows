@@ -259,3 +259,94 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
 
 - `f342059` perf: 摄像头/麦克风检测 DLL 缓存 + 空闲降频 + 持续未知告警
 - 基础指示灯功能来自 `38aa144` feat: 摄像头/麦克风占用指示灯（绿/橙/紫），覆盖虚拟设备
+
+---
+
+## v1.5.0 — 远程模式 + 配套服务器
+
+### 改动概述
+
+1. **新增 `remote_client.py`**：纯标准库实现（urllib + ssl + http.cookiejar + hashlib）。
+   - **不引入 requests**，UCopy.exe 体积不变。
+   - HTTPS + TLS 1.2+ + 自签证书 fingerprint pinning。
+   - `TrustedServerStore` 把 SHA-256(server cert DER) 持久化到 `~/.ucopy_trusted_servers.json`。
+   - `sanitize_config_for_remote`：**双层剥除** `security.password_hash / password_salt / qa`，确保上传/拉取不会泄漏密码。
+   - `normalize_server_address`：支持 `[ipv6]:port` / `ipv4:port` / `host:port`，拒绝 `http://` / `ftp://`。
+   - `RemoteClient.upload_file` 走 `http.client.HTTPSConnection` 直连（不走 urllib 池）—— 因为 BaseHTTPRequestHandler + `Connection: close` + urllib keep-alive 池实测 30s+ 不返回响应（实测发现）。
+
+2. **新增 `ucopy_server/`** 独立 Python 包（不跟 UCopy 主程序一起打包）：
+   - 纯标准库 server（`http.server` + sqlite3 + `ssl`），不引第三方依赖。
+   - `server.py` HTTPS + REST API（login / me / config / files CRUD / admin users）+ 静态文件服务 Web GUI。
+   - `auth.py` PBKDF2-SHA256 × 200k 密码哈希 + sha256 session token（不存原密码）。
+   - `db.py` SQLite (users / sessions / user_configs / file_index)，WAL 模式 + foreign_keys。
+   - `storage.py` 路径校验（拒绝 `..` / 绝对路径 / 盘符），原子写入 `.tmp` + `os.replace`，配额检查。
+   - `cert.py` 自动检测本机 IPv4/IPv6 地址写 SAN（首次启动调用 openssl 生成自签证书，7 天内续签）。
+   - `launchd.py` macOS 自启动：写 `~/Library/LaunchAgents/com.skyc8266.ucopy-server.plist` + `launchctl load/unload`。Linux 上 no-op。
+   - `config.py` 服务器配置（监听端口 / 数据目录 / 初始管理员）。
+   - `static/index.html` 简单 Web GUI（登录 + 用户管理 + launchd 开关 + 文件浏览 + 配置 JSON 编辑）。
+
+3. **`ucopy.py` 集成**：
+   - `DEFAULT_CONFIG` 新增 `remote` 段（enabled / server_url / username / auto_upload / trusted_fingerprint / last_error / last_upload_at / last_config_sync_at）。
+   - `get_config()` 加 remote 段类型归一化。
+   - `RemoteUploader` 后台守护线程：从 queue 拿任务 → `RemoteClient` 上传。先 sha256 check 再 upload（服务端返回 200 / unchanged 短路）。
+   - `copy_drive` 增加可选 `on_file_copied` 回调，每复制成功一个文件入队 → `remote_uploader.enqueue`。
+   - `RemoteConsentWindow` 强制确认弹窗：**三项 checkbox 必须全部勾选**才能启用远程模式（满足用户硬性偏好）：
+     1. 我仅将本工具用于合法用途，因滥用产生的全部责任由我本人承担
+     2. 我没有受到欺骗或诱导而启用此模式
+     3. 我已确认服务器地址正确，且服务器有足够空间存储上传的文件
+   - `SettingsWindow` 加 "远程模式（v1.5.0+）" LabelFrame：服务器地址 / 用户名 / 密码（不存盘） / 启用 / 自动上传 / 证书指纹 / 状态 / 测试连接 / 拉取配置 / 推送配置 按钮。
+   - 密码**绝不存盘**，每次 UI 输入后注入到 `UCopyApp._remote_password`（会话级）。
+   - `UCopyApp.quit_app` 退出时 `remote_uploader.stop()` 干净停。
+
+4. **mac 自启动管理（服务器侧）**：
+   - 服务器首次启动在 macOS 上自动注册 launchd plist 到 `~/Library/LaunchAgents/com.skyc8266.ucopy-server.plist`。
+   - Web GUI "launchd 自启动" 按钮可手动 install / uninstall。
+   - Linux 上全 no-op。
+
+5. **摄像头/麦克风隐私检测**：**未做改动**，保持 v1.4.3 实现。漏检场景（kernel filter driver / 三种 share_mode 全 SUCCESS）超出范围，按用户原话"修不了就算了"，写进已知边界。
+
+### 测试覆盖
+
+- `python3 device_indicator.py --selftest` → **48/48 项断言通过**（未变）
+- `python3 .selftest.py` → **全部通过**（原 150 项 + 新增 30 项远程模式）
+  - sanitize_config_for_remote（2 项）：security 顶层剥 / 非 security 块不剥
+  - normalize_server_address（10 项）：合法格式 + 拒绝非法
+  - TrustedServerStore（2 项）：trust/persist/case-insensitive/forget + 损坏文件容错
+  - DEFAULT_CONFIG.remote 字段完整性（8 项）
+  - RemoteConsentWindow 三项 checkbox（1 项）
+  - RemoteUploader 类存在 + 关键方法（6 项）
+- 端到端联调（手动）：server 启动 + login + push_config（密码已脱敏）+ upload + sha256 check + list + download + 重复 upload（unchanged 短路）+ delete 全部跑通。
+
+### 关键设计取舍
+
+| 取舍 | 决定 | 理由 |
+|---|---|---|
+| 客户端 transport 库 | 纯 stdlib (urllib) | 不引 requests → UCopy.exe 体积不变；延续"无新增第三方依赖"原则 |
+| 客户端 HTTPS 验证 | self-signed + fingerprint pin | adhoc SSL + 用户首次确认后存盘指纹；避免 MITM |
+| 双层密码脱敏 | 客户端 sanitize + 服务端 sanitize | 任一环节出错都不会泄漏 |
+| 配置文件传输 | 客户端不存密码 → 服务端无密码可看 | 远程密码只活在本会话内存 |
+| 启动 multipart 路径 | 直连 http.client.HTTPSConnection（不走 urllib 池） | 反复实测：urllib keep-alive 池在 server Connection: close 下 hang 30s+；直连每次新 TLS 0.01s |
+| 上传 body 构造 | 一次性读 file + bytes 拼接 | 流式 + urllib 池化不稳定；一次性接受内存开销换稳定（一次复制几十文件，单文件 <100MB 完全可接受） |
+| 配额模型 | 用户 quota_mb（默认 10GB，admin 0=不限） | 多用户 / 防滥用；admin 默认不限方便自托管 |
+| 强制确认弹窗 | 三项 checkbox 全勾才能启用 | 用户硬性偏好；非用户主动进入设置时不弹窗（保留"主动弹窗禁止"原则） |
+| 自启动 | macOS launchd + Linux no-op | 用户要求 macOS 专属功能；Windows 用户不需要（UCopy 自带注册表自启动） |
+| 服务器摄像头指纹 | 仅存 SHA-256 DER hex | 非密码，可本地存；指纹变更要求重新信任 + 重输密码 |
+| 服务器 GUI | 纯 HTML/JS 单文件 | 不引前端框架；Web GUI 在 static/index.html |
+
+### 兼容性
+
+- `~/.ucopy_settings.json` 缺 `remote` 段时 `get_config()` 自动回填默认值（与其它新字段同等处理）。
+- 服务器配置 `~/UCopyServer/server.json` 缺 `initial_admin.password` 时首次启动随机生成并**打印到终端**（用户必须从终端看，不能从 Web GUI）。
+- 服务器 `data_dir/files/<username>/<rel_path>`：admin / user / readonly 各有自己根目录。
+- 历史 UCopy.exe 配置文件零迁移（remote 段可选填）。
+
+### 未在本版做的事（已知边界）
+
+- **WebSocket 上传进度推送**：当前 upload progress 回调只在 client 内部，无 UI 进度条显示。可后续加。
+- **客户端 sha256 缓存**：每次上传前都重算 sha256（~100MB/s，无 IO 瓶颈但 CPU 浪费）。可后续加 file_hash_cache。
+- **服务端媒体预览**：Web GUI 文件列表不显示缩略图 / 视频预览（raw video / mp4 不在范围内）。
+- **摄像头/麦克风检测改进**：kernel filter driver 漏检（pitfall #17）未处理，超出范围；按用户原话"修不了就算了，一切问题都怪微软！"。
+
+### 相关 commit
+
+（本次完成后填写）

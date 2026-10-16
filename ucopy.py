@@ -7,6 +7,7 @@ import hashlib
 import secrets
 import datetime
 import threading
+import queue
 import logging
 import logging.handlers
 import zlib
@@ -24,6 +25,14 @@ import win32gui_struct
 import pythoncom
 
 import device_indicator
+remote_client = None
+REMOTE_CLIENT_AVAILABLE = False
+try:
+    import remote_client as _rc
+    remote_client = _rc
+    REMOTE_CLIENT_AVAILABLE = True
+except ImportError:
+    pass
 
 # ---------- 全局配置 ----------
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".ucopy_settings.json")
@@ -60,6 +69,21 @@ DEFAULT_CONFIG = {
     "indicator_slowdown": True,
     "indicator_active_interval": 1.0,
     "indicator_idle_interval": 5.0,
+    # 远程模式（v1.5.0+）：连接远程服务器上传拷贝到的文件 + 同步配置
+    "remote": {
+        "enabled": False,
+        "server_url": "",
+        "username": "",
+        # 自动上传拷贝到本地的文件（受 extensions/regex_pattern/max_single_file_mb 过滤）
+        "auto_upload": True,
+        # 远程服务器 TLS 证书指纹（SHA-256 DER hex），首次信任后由客户端持久化
+        # 这里只保存一份"上次信任的指纹"用于 UI 显示；实际信任列表在 ~/.ucopy_trusted_servers.json
+        "trusted_fingerprint": "",
+        # 上次拉取/推送的时间戳与错误（UI 显示用）
+        "last_error": "",
+        "last_upload_at": "",
+        "last_config_sync_at": "",
+    },
     "security": {
         "password_hash": "",
         "password_salt": "",
@@ -140,6 +164,27 @@ def get_config():
                 cfg[k] = max(0.01, float(cfg.get(k, default)))
             except (TypeError, ValueError):
                 cfg[k] = default
+        # 远程模式段类型归一化
+        rem = cfg.setdefault("remote", {})
+        if not isinstance(rem, dict):
+            rem = {}
+            cfg["remote"] = rem
+        for k, default in (
+            ("enabled", False),
+            ("server_url", ""),
+            ("username", ""),
+            ("auto_upload", True),
+            ("trusted_fingerprint", ""),
+            ("last_error", ""),
+            ("last_upload_at", ""),
+            ("last_config_sync_at", ""),
+        ):
+            if k not in rem or rem[k] is None:
+                rem[k] = default
+        rem["enabled"] = bool(rem.get("enabled"))
+        rem["auto_upload"] = bool(rem.get("auto_upload"))
+        rem["server_url"] = str(rem.get("server_url") or "")
+        rem["username"] = str(rem.get("username") or "")
         # 旧版本用 blacklisted 字段表示"在黑名单里"，迁移成通用的 listed。
         # 迁移必须结合当前模式：白名单模式下 listed 的含义与 blacklisted 相反。
         mode = cfg["device_list_mode"]
@@ -312,8 +357,12 @@ def should_skip_copy(src_file, dest_file, mtime_tolerance=DEFAULT_MTIME_TOLERANC
         return False
     return is_dest_same_as_src(src_stat, dst_stat, mtime_tolerance)
 
-def copy_drive(drive_letter, config):
-    """执行复制，返回 (success, message)"""
+def copy_drive(drive_letter, config, on_file_copied=None):
+    """执行复制，返回 (success, message)。
+
+    on_file_copied 可选回调：每成功复制一个文件调一次，参数 (dest_file, size, mtime)。
+    用于在远程模式下入队上传（不阻塞复制主流程）。
+    """
     logger = logging.getLogger("UCopy")
     target_base = config["target_folder"]
     if not target_base:
@@ -421,6 +470,13 @@ def copy_drive(drive_letter, config):
                     os.replace(temp_file, dest_file)
                     logger.info(f"复制成功: {src_file} -> {dest_file}")
                     copied_count += 1
+                    if on_file_copied is not None:
+                        try:
+                            st = os.stat(dest_file)
+                            on_file_copied(dest_file, st.st_size, st.st_mtime)
+                        except Exception as cb_err:
+                            # 回调异常不能影响复制主流程
+                            logger.debug(f"on_file_copied 回调异常: {cb_err}")
                 except Exception as e:
                     if os.path.exists(temp_file):
                         try:
@@ -476,6 +532,191 @@ def setup_logger(target_folder):
     logger.addHandler(console)
 
     return logger
+
+# ---------- 远程上传器（v1.5.0+）----------
+class RemoteUploader:
+    """
+    后台守护线程：从 queue 拿任务，用 RemoteClient 上传文件到服务器。
+
+    设计要点：
+      - 单 daemon 线程（关窗即停）
+      - 任务：{'src_file': str, 'size': int, 'mtime': float, 'rel_path': str}
+      - 每次上传前调 client.check_sha256；相同跳过（节省带宽）
+      - 上传失败重试 3 次（指数退避 1s / 2s / 4s）
+      - 任何异常写 self.last_error + logger.warning；不弹窗（规则：自启动路径不弹）
+      - 登录失败（401）→ 暂停 5s 后重试一次；再失败 → 停 queue 直到 set_enabled(True)
+      - 不存密码：每次 login 用 self.password（UI 层注入）
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.client = None
+        self.username = ""
+        self.password = ""
+        self.server_url = ""
+        self.enabled = False  # 远程模式总开关
+        self.auto_upload = True
+        self.last_error = ""
+        self.last_upload_at = ""
+        self.uploaded_count = 0
+        self.skipped_count = 0
+        self.failed_count = 0
+
+    def configure(self, server_url: str, username: str, password: str,
+                  auto_upload: bool = True):
+        """更新配置（UI 层调）。如果 server_url 变化，重建 client。"""
+        new_url = (server_url or "").strip()
+        if new_url != self.server_url:
+            self.client = None  # 下次 _ensure_client 重建
+        self.server_url = new_url
+        self.username = username
+        self.password = password
+        self.auto_upload = bool(auto_upload)
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = bool(enabled)
+        if not enabled:
+            self.last_error = ""
+            # 不清空 queue：下次启用时仍可尝试上传
+
+    def start(self):
+        if self.thread is None or not self.thread.is_alive():
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def stop(self, join_timeout: float = 2.0):
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=join_timeout)
+
+    def enqueue(self, dest_file: str, size: int, mtime: float,
+                rel_path: str):
+        """UI/copy_drive 钩子入队。"""
+        if not self.enabled or not self.auto_upload:
+            return
+        self.queue.put({
+            "src_file": dest_file,
+            "size": size,
+            "mtime": mtime,
+            "rel_path": rel_path,
+        })
+        self.start()  # 线程可能因异常停了，重新启
+
+    def _ensure_client(self):
+        if self.client is not None:
+            return self.client
+        if not self.server_url:
+            raise RuntimeError("未配置服务器地址")
+        if not REMOTE_CLIENT_AVAILABLE:
+            raise RuntimeError("remote_client 模块不可用")
+        if not remote_client:
+            raise RuntimeError("remote_client 模块不可用")
+        store = remote_client.TrustedServerStore()
+        self.client = remote_client.RemoteClient(self.server_url, store=store)
+        return self.client
+
+    def _login(self):
+        """登录；失败抛。"""
+        client = self._ensure_client()
+        if not self.username or not self.password:
+            raise RuntimeError("未配置用户名/密码")
+        client.login(self.username, self.password)
+
+    def _upload_one(self, task: dict):
+        """单文件上传：先 check，再 upload。"""
+        client = self._ensure_client()
+        rel_path = task["rel_path"]
+        src = task["src_file"]
+        size = task["size"]
+        mtime = task["mtime"]
+        # 算 sha256
+        sha = hashlib.sha256()
+        try:
+            with open(src, "rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    sha.update(chunk)
+            sha_hex = sha.hexdigest()
+        except OSError as e:
+            raise RuntimeError(f"读文件失败 {src}: {e}")
+
+        # 检查服务端是否已存在相同内容
+        try:
+            if client.check_sha256(rel_path, sha_hex):
+                self.skipped_count += 1
+                return "skipped"
+        except remote_client.RemoteError as e:
+            # 401 / 网络错误 → 抛上去走重试逻辑
+            if e.http_status == 401:
+                raise
+            # 其它 4xx 视为单文件问题，继续尝试上传
+            self.app.logger.debug(f"check_sha256 失败（将继续尝试上传）: {e}")
+
+        # 上传
+        client.upload_file(rel_path, src, sha_hex, size, mtime)
+        self.uploaded_count += 1
+        self.last_upload_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return "uploaded"
+
+    def _run(self):
+        logger = logging.getLogger("UCopy")
+        backoff = [1, 2, 4]
+        login_backoff_counter = 0
+        while not self.stop_event.is_set():
+            if not self.enabled:
+                # 远程模式关闭 → 等 5s 再看
+                self.stop_event.wait(timeout=5.0)
+                continue
+            try:
+                task = self.queue.get(timeout=2.0)
+            except queue.Empty:
+                continue
+            # 登录（如未登录）
+            if self.client is None or not getattr(self.client, "_jar", None):
+                try:
+                    self._login()
+                except Exception as e:
+                    login_backoff_counter += 1
+                    wait = min(backoff[min(login_backoff_counter - 1, 2)], 30)
+                    self.last_error = f"登录失败: {e}"
+                    logger.warning(f"[remote] 登录失败 ({login_backoff_counter}), {wait}s 后重试: {e}")
+                    # 把任务放回队列头
+                    self.queue.put(task)
+                    self.stop_event.wait(timeout=wait)
+                    continue
+                login_backoff_counter = 0
+
+            # 尝试上传（最多 3 次）
+            ok = False
+            for attempt in range(3):
+                try:
+                    result = self._upload_one(task)
+                    logger.info(f"[remote] {task['rel_path']}: {result}")
+                    ok = True
+                    break
+                except remote_client.RemoteError as e:
+                    self.last_error = f"上传失败 ({e.code}): {e.message}"
+                    logger.warning(f"[remote] 上传失败 attempt={attempt+1}: {e}")
+                    if e.http_status == 401:
+                        # session 过期 → 清 client，下次重新登录
+                        self.client = None
+                        break
+                    if attempt < 2:
+                        self.stop_event.wait(timeout=backoff[attempt])
+                except Exception as e:
+                    self.last_error = f"上传异常: {e}"
+                    logger.exception(f"[remote] 上传异常 attempt={attempt+1}: {e}")
+                    if attempt < 2:
+                        self.stop_event.wait(timeout=backoff[attempt])
+            if not ok:
+                self.failed_count += 1
+
 
 # ---------- 设备监控 ----------
 class DeviceMonitor:
@@ -698,12 +939,27 @@ class UCopyApp:
         self._last_open_ts = 0.0  # 打开设置面板的防抖时间戳
         self.job_lock = threading.Lock()
         self.current_jobs = {}
+        # 远程模式（v1.5.0+）：后台线程从队列拿任务上传
+        self.remote_uploader = RemoteUploader(self)
+        self._remote_password = ""  # UI 层注入（不写 config.json）
+        self._init_remote_from_config()
 
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("UCopy")
 
         set_auto_start(self.config.get("auto_start", False))
+
+    def _init_remote_from_config(self):
+        """把 config.remote 同步到 RemoteUploader（密码从 self._remote_password）。"""
+        rem = self.config.get("remote", {}) or {}
+        self.remote_uploader.configure(
+            server_url=rem.get("server_url", ""),
+            username=rem.get("username", ""),
+            password=self._remote_password,
+            auto_upload=rem.get("auto_upload", True),
+        )
+        self.remote_uploader.set_enabled(bool(rem.get("enabled", False)))
 
     def init_logger(self):
         target = self.config.get("target_folder", "")
@@ -753,8 +1009,26 @@ class UCopyApp:
             t.start()
 
     def copy_job(self, drive_letter):
-        success, msg = copy_drive(drive_letter, self.config)
-        self.logger.info(f"复制任务结束 ({drive_letter}): {msg}")
+        logger = self.logger or logging.getLogger("UCopy")
+
+        def _on_copied(dest_file, size, mtime):
+            # dest_file 是本地的完整路径；rel_path 用相对 target_folder
+            try:
+                target_base = self.config.get("target_folder", "")
+                if target_base and dest_file.lower().startswith(
+                        target_base.lower()):
+                    rel = os.path.relpath(dest_file, target_base)
+                else:
+                    rel = os.path.basename(dest_file)
+                # Windows 路径分隔符统一为 /，与服务端约定
+                rel = rel.replace(os.sep, "/")
+                self.remote_uploader.enqueue(dest_file, size, mtime, rel)
+            except Exception as e:
+                logger.debug(f"远程入队失败: {e}")
+
+        success, msg = copy_drive(drive_letter, self.config,
+                                  on_file_copied=_on_copied)
+        logger.info(f"复制任务结束 ({drive_letter}): {msg}")
 
     def start_monitor(self):
         if self.monitor is None:
@@ -887,6 +1161,10 @@ class UCopyApp:
 
     def quit_app(self, icon=None, item=None):
         self.logger.info("用户请求退出程序")
+        try:
+            self.remote_uploader.stop()
+        except Exception:
+            pass
         self.stop_monitor()
         self.stop_indicator()
         if self.floating_dot:
@@ -1403,6 +1681,84 @@ class ChangeQAWindow:
         self.win.destroy()
 
 
+# ---------- 远程模式：强制确认弹窗 ----------
+class RemoteConsentWindow:
+    """
+    开启远程模式前的强制确认弹窗。三项 checkbox 必须全部勾选才能启用。
+
+    设计：作为 modal 子窗口（grab_set + wait_window），返回 True/False。
+    """
+
+    CONSENT_ITEMS = [
+        "我仅将本工具用于合法用途，因滥用产生的全部责任由我本人承担。",
+        "我没有受到欺骗或诱导而启用此模式。",
+        "我已确认服务器地址正确，且服务器有足够空间存储上传的文件。",
+    ]
+
+    def __init__(self, master, server_url: str):
+        self.win = tk.Toplevel(master)
+        self.win.title("启用远程模式 — 重要确认")
+        self.win.resizable(False, False)
+        self.win.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.result = False
+
+        frm = ttk.Frame(self.win, padding=14)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="⚠️  启用远程模式前请逐条确认以下事项：",
+                  font=("", 11, "bold")).grid(row=0, column=0,
+                                             columnspan=2, sticky="w",
+                                             pady=(0, 8))
+
+        info = ttk.Label(frm,
+                         text=f"服务器地址：\n{server_url or '(未填写)'}",
+                         foreground="#444", wraplength=420, justify="left")
+        info.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        self.checks = []
+        for i, text in enumerate(self.CONSENT_ITEMS):
+            var = tk.BooleanVar(value=False)
+            cb = ttk.Checkbutton(frm, text=text, variable=var,
+                                 command=self._refresh_state)
+            cb.grid(row=2 + i, column=0, columnspan=2, sticky="w",
+                    padx=4, pady=2)
+            self.checks.append(var)
+
+        # 按钮区
+        btn = ttk.Frame(frm)
+        btn.grid(row=2 + len(self.CONSENT_ITEMS), column=0,
+                 columnspan=2, pady=(16, 0))
+        self.ok_btn = ttk.Button(btn, text="启用（必须三项都勾选）",
+                                 command=self._on_ok, state="disabled")
+        self.ok_btn.pack(side="left", padx=6)
+        ttk.Button(btn, text="取消", command=self._on_cancel).pack(
+            side="left", padx=6)
+
+        self.win.grab_set()
+        self._refresh_state()
+
+    def _all_checked(self) -> bool:
+        return all(v.get() for v in self.checks)
+
+    def _refresh_state(self):
+        self.ok_btn.config(state=("normal" if self._all_checked()
+                                  else "disabled"))
+
+    def _on_ok(self):
+        if not self._all_checked():
+            return
+        self.result = True
+        self.win.destroy()
+
+    def _on_cancel(self):
+        self.result = False
+        self.win.destroy()
+
+    def show(self) -> bool:
+        self.win.wait_window()
+        return self.result
+
+
 # ---------- 设置窗口 ----------
 class SettingsWindow:
     def __init__(self, master, app, on_close=None):
@@ -1484,15 +1840,300 @@ class SettingsWindow:
 
         self.on_mode_changed()   # 初始化按钮文字与提示
 
+        # ---- 远程模式 ----
+        frame_remote = ttk.LabelFrame(self.win, text="远程模式（v1.5.0+）",
+                                       padding=5)
+        frame_remote.grid(row=2, column=0, columnspan=2, padx=5, pady=5,
+                          sticky="nsew")
+        self._build_remote_frame(frame_remote)
+
         # 底部按钮
         btn_frame = ttk.Frame(self.win)
-        btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
         ttk.Button(btn_frame, text="保存并隐藏", command=self.save_and_hide).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="修改密码", command=self.change_password).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="修改密保", command=self.change_qa).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="退出程序", command=self.app.quit_app).pack(side=tk.LEFT, padx=5)
 
         self.win.grab_set()
+
+    def _build_remote_frame(self, parent):
+        """构造远程模式子面板。"""
+        cfg_remote = (self.app.config.get("remote") or {})
+        # 服务器地址
+        ttk.Label(parent, text="服务器地址 (https://host:8443):").grid(
+            row=0, column=0, sticky="w", padx=5, pady=2)
+        self.remote_url_var = tk.StringVar(value=cfg_remote.get("server_url", ""))
+        ttk.Entry(parent, textvariable=self.remote_url_var, width=42).grid(
+            row=0, column=1, columnspan=2, padx=5, pady=2, sticky="w")
+
+        # 用户名
+        ttk.Label(parent, text="用户名:").grid(row=1, column=0, sticky="w",
+                                              padx=5, pady=2)
+        self.remote_user_var = tk.StringVar(value=cfg_remote.get("username", ""))
+        ttk.Entry(parent, textvariable=self.remote_user_var, width=20).grid(
+            row=1, column=1, padx=5, pady=2, sticky="w")
+
+        # 密码（每次手动输入，不存盘）
+        ttk.Label(parent, text="服务器密码 (不存盘):").grid(
+            row=2, column=0, sticky="w", padx=5, pady=2)
+        self.remote_pw_var = tk.StringVar()
+        self.remote_pw_entry = ttk.Entry(parent, textvariable=self.remote_pw_var,
+                                        show="*", width=20)
+        self.remote_pw_entry.grid(row=2, column=1, padx=5, pady=2, sticky="w")
+
+        # 启用 + 自动上传
+        self.remote_enabled_var = tk.BooleanVar(value=bool(cfg_remote.get("enabled", False)))
+        self.remote_auto_var = tk.BooleanVar(value=bool(cfg_remote.get("auto_upload", True)))
+        ttk.Checkbutton(parent, text="启用远程模式",
+                        variable=self.remote_enabled_var).grid(
+            row=3, column=0, sticky="w", padx=5, pady=2)
+        ttk.Checkbutton(parent, text="自动上传已拷贝文件",
+                        variable=self.remote_auto_var).grid(
+            row=3, column=1, sticky="w", padx=5, pady=2)
+
+        # 指纹 + 状态
+        self.remote_fp_var = tk.StringVar(value=cfg_remote.get("trusted_fingerprint", ""))
+        ttk.Label(parent, text="服务器证书指纹:").grid(
+            row=4, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(parent, textvariable=self.remote_fp_var, foreground="#555",
+                  font=("Courier", 9)).grid(
+            row=4, column=1, columnspan=2, sticky="w", padx=5, pady=2)
+
+        self.remote_status_var = tk.StringVar(value=self._status_text())
+        ttk.Label(parent, textvariable=self.remote_status_var, foreground="#333",
+                  wraplength=380, justify="left").grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+
+        # 操作按钮
+        btn_row = ttk.Frame(parent)
+        btn_row.grid(row=6, column=0, columnspan=3, pady=(6, 0))
+        ttk.Button(btn_row, text="测试连接", command=self.test_remote).pack(
+            side="left", padx=4)
+        ttk.Button(btn_row, text="从服务器拉取配置",
+                   command=self.pull_remote_config).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="推送配置到服务器",
+                   command=self.push_remote_config).pack(side="left", padx=4)
+
+    def _status_text(self):
+        u = self.app.remote_uploader
+        parts = []
+        if u.last_upload_at:
+            parts.append(f"上次上传: {u.last_upload_at}")
+        if u.last_error:
+            parts.append(f"错误: {u.last_error}")
+        parts.append(f"已上传 {u.uploaded_count} / 跳过 {u.skipped_count} / 失败 {u.failed_count}")
+        return " | ".join(parts)
+
+    def _refresh_remote_status(self):
+        self.remote_status_var.set(self._status_text())
+
+    def _persist_remote(self, enabled_now: bool):
+        """把 UI 的 remote 段写回 cfg + 同步到 RemoteUploader，启用时弹强制确认。"""
+        new_enabled = bool(self.remote_enabled_var.get())
+        # 关闭路径：不弹确认，直接关
+        if not new_enabled:
+            self.app.config.setdefault("remote", {})
+            self.app.config["remote"].update({
+                "enabled": False,
+                "server_url": self.remote_url_var.get().strip(),
+                "username": self.remote_user_var.get().strip(),
+                "auto_upload": bool(self.remote_auto_var.get()),
+            })
+            try:
+                save_config(self.app.config)
+            except Exception:
+                pass
+            self.app.remote_uploader.configure(
+                server_url=self.app.config["remote"]["server_url"],
+                username=self.app.config["remote"]["username"],
+                password=self.app._remote_password,
+                auto_upload=self.app.config["remote"]["auto_upload"],
+            )
+            self.app.remote_uploader.set_enabled(False)
+            try:
+                self.app.logger.info("[remote] 远程模式已关闭")
+            except Exception:
+                pass
+            return True
+
+        # 启用路径
+        url = self.remote_url_var.get().strip()
+        user = self.remote_user_var.get().strip()
+        pw = self.remote_pw_var.get()
+        if not url:
+            messagebox.showerror("错误", "请填写服务器地址", parent=self.win)
+            return False
+        if not user:
+            messagebox.showerror("错误", "请填写用户名", parent=self.win)
+            return False
+        if not pw:
+            messagebox.showerror("错误",
+                                 "请填写服务器密码（不存盘，仅本次会话使用）",
+                                 parent=self.win)
+            return False
+        # 强制确认
+        if not RemoteConsentWindow(self.win, url).show():
+            # 用户取消
+            self.remote_enabled_var.set(False)
+            return False
+
+        # 写回 + 启动
+        self.app.config.setdefault("remote", {})
+        self.app.config["remote"].update({
+            "enabled": True,
+            "server_url": url,
+            "username": user,
+            "auto_upload": bool(self.remote_auto_var.get()),
+        })
+        try:
+            save_config(self.app.config)
+        except Exception:
+            pass
+        self.app._remote_password = pw
+        self.app.remote_uploader.configure(
+            server_url=url,
+            username=user,
+            password=pw,
+            auto_upload=bool(self.remote_auto_var.get()),
+        )
+        self.app.remote_uploader.set_enabled(True)
+        # 清掉密码输入框（不留存）
+        self.remote_pw_var.set("")
+        try:
+            self.app.logger.info(f"[remote] 远程模式已启用: {url}")
+        except Exception:
+            pass
+        self._refresh_remote_status()
+        return True
+
+    def test_remote(self):
+        url = self.remote_url_var.get().strip()
+        user = self.remote_user_var.get().strip()
+        pw = self.remote_pw_var.get()
+        if not (url and user and pw):
+            messagebox.showerror("错误", "请填写服务器地址 / 用户名 / 密码",
+                                 parent=self.win)
+            return
+        if not REMOTE_CLIENT_AVAILABLE:
+            messagebox.showerror("错误", "remote_client 模块不可用",
+                                 parent=self.win)
+            return
+        try:
+            client = remote_client.RemoteClient(url)
+            client.login(user, pw)
+            me = client.me()
+            messagebox.showinfo("成功",
+                                f"登录成功！\n用户名: {me['username']}\n"
+                                f"角色: {me['role']}\n"
+                                f"配额: {me['quota_mb']} MB",
+                                parent=self.win)
+            # 把已存在的指纹写到 trusted store（测试连接就是信任）
+            fp = client.get_current_fingerprint()
+            if fp:
+                client.store.trust(url, fp)
+                self.remote_fp_var.set(fp)
+                self.app.config.setdefault("remote", {})
+                self.app.config["remote"]["trusted_fingerprint"] = fp
+                try:
+                    save_config(self.app.config)
+                except Exception:
+                    pass
+            # 同时让 uploader 拿到 client（如果已启用就直接复用）
+            self.app._remote_password = pw
+            self.app.remote_uploader.configure(
+                server_url=url, username=user, password=pw,
+                auto_upload=bool(self.remote_auto_var.get()),
+            )
+            self.app.remote_uploader.client = client
+        except remote_client.RemoteError as e:
+            messagebox.showerror("连接失败",
+                                 f"{f'[{e.code}] ' if e.code else ''}{e.message}",
+                                 parent=self.win)
+        except Exception as e:
+            messagebox.showerror("连接失败", str(e), parent=self.win)
+
+    def pull_remote_config(self):
+        """从服务器拉取配置（覆盖本地 security.* 之外的所有字段）。"""
+        url = self.remote_url_var.get().strip()
+        user = self.remote_user_var.get().strip()
+        pw = self.remote_pw_var.get()
+        if not (url and user and pw):
+            messagebox.showerror("错误", "请填写服务器地址 / 用户名 / 密码",
+                                 parent=self.win)
+            return
+        try:
+            client = remote_client.RemoteClient(url)
+            client.login(user, pw)
+            remote_cfg = client.fetch_config()
+            if not remote_cfg:
+                messagebox.showinfo("提示", "服务器上还没有保存任何配置",
+                                    parent=self.win)
+                return
+            # 保留本地 security（不要被覆盖）
+            local_sec = self.app.config.get("security", {}) or {}
+            new_cfg = {**remote_cfg, "security": local_sec}
+            # 不要覆盖 remote 段（server_url / enabled / 等是本地的）
+            new_cfg["remote"] = self.app.config.get("remote", {})
+            self.app.config = new_cfg
+            save_config(self.app.config)
+            self.app._remote_password = pw
+            self.app.remote_uploader.configure(
+                server_url=url, username=user, password=pw,
+                auto_upload=bool(self.remote_auto_var.get()),
+            )
+            self.app.remote_uploader.client = client
+            messagebox.showinfo("成功", "已从服务器拉取配置（密码/密保保留本地）",
+                                parent=self.win)
+            try:
+                self.app.config["remote"]["last_config_sync_at"] = (
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                save_config(self.app.config)
+            except Exception:
+                pass
+        except remote_client.RemoteError as e:
+            messagebox.showerror("拉取失败",
+                                 f"{f'[{e.code}] ' if e.code else ''}{e.message}",
+                                 parent=self.win)
+
+    def push_remote_config(self):
+        """把本地配置推送到服务器。"""
+        url = self.remote_url_var.get().strip()
+        user = self.remote_user_var.get().strip()
+        pw = self.remote_pw_var.get()
+        if not (url and user and pw):
+            messagebox.showerror("错误", "请填写服务器地址 / 用户名 / 密码",
+                                 parent=self.win)
+            return
+        if not messagebox.askyesno("确认推送",
+                                    "推送会把当前本地配置写到服务器。\n"
+                                    "服务器上的旧配置将被覆盖。\n"
+                                    "确定吗？",
+                                    parent=self.win):
+            return
+        try:
+            client = remote_client.RemoteClient(url)
+            client.login(user, pw)
+            info = client.push_config(self.app.config)
+            self.app._remote_password = pw
+            self.app.remote_uploader.configure(
+                server_url=url, username=user, password=pw,
+                auto_upload=bool(self.remote_auto_var.get()),
+            )
+            self.app.remote_uploader.client = client
+            try:
+                self.app.config["remote"]["last_config_sync_at"] = (
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                save_config(self.app.config)
+            except Exception:
+                pass
+            messagebox.showinfo("成功",
+                                f"已推送（version {info.get('version')}）",
+                                parent=self.win)
+        except remote_client.RemoteError as e:
+            messagebox.showerror("推送失败",
+                                 f"{f'[{e.code}] ' if e.code else ''}{e.message}",
+                                 parent=self.win)
 
     def on_mode_changed(self, event=None):
         """

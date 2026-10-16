@@ -1,0 +1,337 @@
+"""
+ucopy-server/db.py
+==================
+
+SQLite 数据访问层（users / sessions / per-user config / file metadata）。
+
+线程模型：
+    sqlite3.connect(check_same_thread=False) + 每个请求拿新连接。
+    在 BaseHTTPRequestHandler 单线程下没问题；并发扩展时改用连接池。
+
+数据表：
+
+    users (
+        username TEXT PRIMARY KEY,
+        password_hash TEXT NOT NULL,         -- pbkdf2$...$salt$hash
+        role TEXT NOT NULL CHECK(role IN ('admin','user','readonly')),
+        quota_mb INTEGER NOT NULL DEFAULT 10240,
+        created_at TEXT NOT NULL
+    )
+
+    sessions (
+        id_hash TEXT PRIMARY KEY,            -- sha256(cookie_value)
+        username TEXT NOT NULL REFERENCES users(username),
+        expires_at INTEGER NOT NULL          -- unix timestamp
+    )
+    INDEX idx_sessions_user ON sessions(username);
+
+    user_configs (
+        username TEXT PRIMARY KEY REFERENCES users(username),
+        config_json TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 0,
+        last_modified TEXT NOT NULL
+    )
+
+    file_index (
+        username TEXT NOT NULL,
+        rel_path TEXT NOT NULL,              -- 相对用户根，POSIX 风格
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        sha256 TEXT NOT NULL,
+        PRIMARY KEY (username, rel_path)
+    )
+
+注意：
+    - rel_path 不允许含 '..' 或绝对路径前缀（用 storage.normalize_rel_path 校验）
+    - 用户文件本体存在文件系统上（<data_dir>/files/<username>/<rel_path>）
+    - file_index 是元数据缓存：实际校验以磁盘为准，元数据丢失时重建
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import time
+from typing import Optional
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('admin','user','readonly')),
+    quota_mb INTEGER NOT NULL DEFAULT 10240,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id_hash TEXT PRIMARY KEY,
+    username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username);
+
+CREATE TABLE IF NOT EXISTS user_configs (
+    username TEXT PRIMARY KEY REFERENCES users(username) ON DELETE CASCADE,
+    config_json TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 0,
+    last_modified TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_index (
+    username TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime REAL NOT NULL,
+    sha256 TEXT NOT NULL,
+    PRIMARY KEY (username, rel_path)
+);
+CREATE INDEX IF NOT EXISTS idx_file_index_user ON file_index(username);
+"""
+
+
+def open_db(path: str) -> sqlite3.Connection:
+    """打开 SQLite 连接 + 应用 schema。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.executescript(SCHEMA)
+    return conn
+
+
+# ---------- users ----------
+
+VALID_ROLES = ("admin", "user", "readonly")
+
+
+def add_user(conn, username: str, password_hash: str, role: str,
+             quota_mb: int = 10240) -> None:
+    if role not in VALID_ROLES:
+        raise ValueError(f"invalid role: {role}")
+    conn.execute(
+        "INSERT INTO users(username, password_hash, role, quota_mb, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (username, password_hash, role, quota_mb,
+         time.strftime("%Y-%m-%dT%H:%M:%S")),
+    )
+
+
+def get_user(conn, username: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM users WHERE username = ?", (username,)
+    ).fetchone()
+
+
+def list_users(conn):
+    return conn.execute(
+        "SELECT username, role, quota_mb, created_at FROM users ORDER BY username"
+    ).fetchall()
+
+
+def update_user(conn, username: str, *,
+                password_hash=None,
+                role=None,
+                quota_mb=None) -> None:
+    sets, params = [], []
+    if password_hash is not None:
+        sets.append("password_hash = ?"); params.append(password_hash)
+    if role is not None:
+        if role not in VALID_ROLES:
+            raise ValueError(f"invalid role: {role}")
+        sets.append("role = ?"); params.append(role)
+    if quota_mb is not None:
+        sets.append("quota_mb = ?"); params.append(int(quota_mb))
+    if not sets:
+        return
+    params.append(username)
+    conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE username = ?", params)
+
+
+def delete_user(conn, username: str) -> None:
+    conn.execute("DELETE FROM users WHERE username = ?", (username,))
+
+
+def user_count(conn) -> int:
+    return conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+
+
+# ---------- sessions ----------
+
+def add_session(conn, id_hash: str, username: str, ttl_seconds: int) -> None:
+    expires_at = int(time.time()) + ttl_seconds
+    conn.execute(
+        "INSERT INTO sessions(id_hash, username, expires_at) VALUES (?,?,?)",
+        (id_hash, username, expires_at),
+    )
+
+
+def lookup_session(conn, id_hash: str) -> Optional[sqlite3.Row]:
+    if not id_hash:
+        return None
+    row = conn.execute(
+        "SELECT s.username, s.expires_at, u.role, u.quota_mb "
+        "FROM sessions s JOIN users u ON s.username = u.username "
+        "WHERE s.id_hash = ?", (id_hash,)
+    ).fetchone()
+    if not row:
+        return None
+    if row["expires_at"] < int(time.time()):
+        conn.execute("DELETE FROM sessions WHERE id_hash = ?", (id_hash,))
+        return None
+    return row
+
+
+def delete_session(conn, id_hash: str) -> None:
+    conn.execute("DELETE FROM sessions WHERE id_hash = ?", (id_hash,))
+
+
+def purge_expired_sessions(conn) -> int:
+    """清理过期 session（每个请求顺手跑，副作用是单条 DELETE）。"""
+    cur = conn.execute("DELETE FROM sessions WHERE expires_at < ?",
+                       (int(time.time()),))
+    return cur.rowcount or 0
+
+
+# ---------- user_configs ----------
+
+REDACT_KEYS = ("password_hash", "password_salt", "qa")
+
+
+def _redact(cfg: dict) -> dict:
+    """剥除 security.* 字段。"""
+    if not isinstance(cfg, dict):
+        return cfg
+    out = {}
+    for k, v in cfg.items():
+        if k == "security":
+            sec = v if isinstance(v, dict) else {}
+            out[k] = {sk: sv for sk, sv in sec.items() if sk not in REDACT_KEYS}
+        else:
+            out[k] = _redact(v) if isinstance(v, dict) else v
+    return out
+
+
+def get_user_config(conn, username: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT config_json, version, last_modified FROM user_configs WHERE username = ?",
+        (username,)
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        cfg = json.loads(row["config_json"])
+    except Exception:
+        cfg = {}
+    return {
+        "config": _redact(cfg),
+        "version": row["version"],
+        "last_modified": row["last_modified"],
+    }
+
+
+def put_user_config(conn, username: str, cfg: dict) -> dict:
+    """覆盖存：传上来的 cfg 服务端再次脱敏（双层防御）后写盘。返回新 version。"""
+    sanitized = _redact(cfg)
+    row = conn.execute(
+        "SELECT version FROM user_configs WHERE username = ?", (username,)
+    ).fetchone()
+    new_version = (row["version"] + 1) if row else 1
+    last_modified = time.strftime("%Y-%m-%dT%H:%M:%S")
+    cfg_json = json.dumps(sanitized, ensure_ascii=False, separators=(",", ":"))
+    conn.execute(
+        "INSERT INTO user_configs(username, config_json, version, last_modified) "
+        "VALUES(?,?,?,?) "
+        "ON CONFLICT(username) DO UPDATE SET "
+        "config_json=excluded.config_json, version=excluded.version, "
+        "last_modified=excluded.last_modified",
+        (username, cfg_json, new_version, last_modified),
+    )
+    return {"version": new_version, "last_modified": last_modified}
+
+
+# ---------- file_index ----------
+
+def upsert_file(conn, username: str, rel_path: str, *,
+                size: int, mtime: float, sha256: str) -> None:
+    conn.execute(
+        "INSERT INTO file_index(username, rel_path, size, mtime, sha256) "
+        "VALUES(?,?,?,?,?) "
+        "ON CONFLICT(username, rel_path) DO UPDATE SET "
+        "size=excluded.size, mtime=excluded.mtime, sha256=excluded.sha256",
+        (username, rel_path, size, mtime, sha256),
+    )
+
+
+def delete_file_index(conn, username: str, rel_path: str) -> None:
+    conn.execute(
+        "DELETE FROM file_index WHERE username = ? AND rel_path = ?",
+        (username, rel_path),
+    )
+
+
+def get_file_meta(conn, username: str, rel_path: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM file_index WHERE username = ? AND rel_path = ?",
+        (username, rel_path),
+    ).fetchone()
+
+
+def user_total_size(conn, username: str) -> int:
+    """用户在 file_index 中的总占用（注意：实际磁盘可能略有偏差）。"""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(size), 0) AS total FROM file_index WHERE username = ?",
+        (username,),
+    ).fetchone()
+    return int(row["total"] or 0)
+
+
+def list_files(conn, username: str, rel_dir: str):
+    """列出 username 在 rel_dir 下的直接子项（不含孙子辈）。"""
+    rel_dir = rel_dir.strip("/")
+    prefix = rel_dir + "/" if rel_dir else ""
+    like_pattern = prefix + "%"
+    rows = conn.execute(
+        "SELECT rel_path, size, mtime, sha256 FROM file_index "
+        "WHERE username = ? AND rel_path LIKE ? AND rel_path NOT LIKE ?",
+        (username, like_pattern, prefix + "%/%"),
+    ).fetchall()
+    return [
+        {
+            "name": r["rel_path"][len(prefix):],
+            "type": "file",
+            "size": r["size"],
+            "mtime": r["mtime"],
+            "sha256": r["sha256"],
+        }
+        for r in rows
+    ]
+
+
+def list_dirs(conn, username: str, rel_dir: str):
+    """列出 username 在 rel_dir 下的子目录（仅含直接子目录）。"""
+    rel_dir = rel_dir.strip("/")
+    prefix = rel_dir + "/" if rel_dir else ""
+    like_pattern = prefix + "%"
+    rows = conn.execute(
+        "SELECT DISTINCT rel_path FROM file_index "
+        "WHERE username = ? AND rel_path LIKE ? AND rel_path LIKE ?",
+        (username, like_pattern, prefix + "%/%"),
+    ).fetchall()
+    seen = set()
+    out = []
+    for r in rows:
+        rest = r["rel_path"][len(prefix):]
+        first = rest.split("/", 1)[0]
+        if first in seen:
+            continue
+        seen.add(first)
+        out.append({
+            "name": first,
+            "type": "dir",
+            "size": None,
+            "mtime": None,
+            "sha256": None,
+        })
+    return out
