@@ -64,7 +64,14 @@ jobs:
               --bind-host 127.0.0.1 \
               --no-autostart &
           SERVER_PID=$!
-          sleep 5
+          # 等服务起来（首次启动要建 cert + DB；x86_64 Rosetta 翻译首次跑更慢）
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+              sleep 1
+              if curl -sk https://127.0.0.1:18443/api/v1/ping 2>/dev/null | grep -q '"ok": true'; then
+                  echo "[smoke] server up after ${i}s"
+                  break
+              fi
+          done
           curl -sk https://127.0.0.1:18443/api/v1/ping
           echo
           kill $SERVER_PID || true
