@@ -286,9 +286,10 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
    - `static/index.html` 简单 Web GUI（登录 + 用户管理 + launchd 开关 + 文件浏览 + 配置 JSON 编辑）。
 
 3. **macOS 服务器单文件打包**（PyInstaller `--onefile`）：
-   - `build_macos.sh`：本地构建脚本（默认 arm64；`TARGET_ARCH=x86_64` 切 Intel；`UNIVERSAL=1` 通用二进制）
-   - `.github/workflows/build-server.yml`：CI 在 macos-14 上跑矩阵构建（arm64 + x86_64）+ 产物上 Release
-   - 产物名约定：`UCopy-Server-macos-arm64` / `UCopy-Server-macos-x86_64`（带执行权限）
+   - `build_macos.sh`：本地构建脚本，只构建 arm64（Apple Silicon）
+   - `.github/workflows/build-server.yml`：CI 在 macos-14（arm64）上构建 + 产物上 Release
+   - 产物名：`UCopy-Server-macos-arm64`（带执行权限）
+   - **只支持 Apple Silicon（M 系列芯片）**，不再支持 Intel Mac。原因：Python 3.13 + PyInstaller 6.x 不支持在 arm64 机器上交叉构建 x86_64（`_struct.cpython-313-darwin.so` 是 arm64-only，会抛 `IncompatibleBinaryArchError`）；打 universal binary 需要 x86_64 版 Python 环境。Intel Mac 用户如需跑服务器，走源码 `python3 ucopy_server/server.py`。
    - 端到端验证：打包后二进制 9.5MB，跑 `--help` / 实跑 + curl `/api/v1/ping` / 与 remote_client 完整流程（login/push_config/upload/list/download/unchanged/delete）全部通过
    - **关键 fix**：模块内 `import db as _db` 等相对 import 在 PyInstaller onefile 下失败，改为 `from . import db as _db`（带 try 兜底兼容源码运行）
 
@@ -341,7 +342,7 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
 | 自启动 | macOS launchd + Linux no-op | 用户要求 macOS 专属功能；Windows 用户不需要（UCopy 自带注册表自启动） |
 | 服务器摄像头指纹 | 仅存 SHA-256 DER hex | 非密码，可本地存；指纹变更要求重新信任 + 重输密码 |
 | 服务器 GUI | 纯 HTML/JS 单文件 | 不引前端框架；Web GUI 在 static/index.html |
-| **macOS 服务器打包** | **PyInstaller `--onefile` + arm64+x86_64 双矩阵** | 单文件直接跑；universal binary 通过 lipo 合并；CI 自动 matrix 构建 |
+| **macOS 服务器打包** | **PyInstaller `--onefile`，仅 arm64（Apple Silicon）** | 单文件直接跑；Intel Mac 不再支持（PyInstaller 6.x + Python 3.13 无法交叉构建 x86_64）；CI 在 macos-14 单 arch 构建 |
 | **macOS 打包相对 import 兼容** | **`from . import db` + try 兜底为 `import db`** | onefile 模式下 sys.path 不含当前目录；源码跑用相对 import 仍兼容 |
 
 ### 兼容性
@@ -358,4 +359,3 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
 - **客户端 sha256 缓存**：每次上传前都重算 sha256（~100MB/s，无 IO 瓶颈但 CPU 浪费）。可后续加 file_hash_cache。
 - **服务端媒体预览**：Web GUI 文件列表不显示缩略图 / 视频预览（raw video / mp4 不在范围内）。
 - **摄像头/麦克风检测改进**：kernel filter driver 漏检（pitfall #17）未处理，超出范围；按用户原话"修不了就算了，一切问题都怪微软！"。
-- **macOS 通用二进制**：默认分两个 arch 上传（用户按机器下载），未默认打 universal（体积 ~19MB）。如需打可跑 `UNIVERSAL=1 bash build_macos.sh`。

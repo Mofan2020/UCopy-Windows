@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
-# build_macos.sh — 在 macOS 上把 ucopy_server 打包成单文件可执行
+# build_macos.sh — 在 macOS 上把 ucopy_server 打包成 arm64 单文件可执行
 #
 # 产物: dist/ucopy-server (单文件，可直接 ./ucopy-server 跑)
-# 平台: macOS (arm64 / x86_64 都支持)
-# Python: conda base (Python 3.13 + pyinstaller 6.x)
+# 平台: macOS arm64 (Apple Silicon)。不再支持 Intel x86_64。
+# Python: conda base (Python 3.13 + pyinstaller 6.x) 或 PATH 上的 python3
 #
 # 用法:
-#   bash build_macos.sh                   # 默认：当前 arch
-#   TARGET_ARCH=arm64 bash build_macos.sh # 显式 arm64 (Apple Silicon)
-#   TARGET_ARCH=x86_64 bash build_macos.sh # 显式 x86_64 (Intel)
-#   UNIVERSAL=1 bash build_macos.sh       # 通用二进制 (arm64 + x86_64 合一)
+#   bash build_macos.sh    # 一键构建 arm64
 #
 # 注意:
 #   - PyInstaller 会调用 openssl（cert.py 用）→ 必须 macOS 自带 openssl
 #   - 自签证书生成走系统 openssl → 服务器首次启动需要 openssl 在 PATH
-#   - 通用二进制需要两个单 arch 都构建后用 lipo 合并，体积会变大
+#   - Intel Mac 不再支持（PyInstaller 不支持 macOS Rosetta 翻译构建 x86_64）
 
 set -e
 
 cd "$(dirname "$0")"
 
+# Apple Silicon only — M 系列芯片
 if [[ "$(uname)" != "Darwin" ]]; then
     echo "ERROR: build_macos.sh 必须在 macOS 上跑" >&2
+    exit 1
+fi
+if [[ "$(uname -m)" != "arm64" ]]; then
+    echo "ERROR: 本项目不再支持 Intel Mac。请在搭载 M 系列芯片的 Mac 上构建。" >&2
+    echo "       (Python 3.13 + PyInstaller 6.x 不支持跨 arch Rosetta 构建)" >&2
     exit 1
 fi
 
@@ -52,59 +55,38 @@ fi
 rm -rf build dist
 echo "[clean] build/ dist/ 已清理"
 
-TARGET_ARCH="${TARGET_ARCH:-$(uname -m)}"
+echo
+echo "============================================="
+echo "[build] target arch: arm64 (Apple Silicon only)"
+echo "============================================="
 
-build_one_arch() {
-    local arch="$1"
-    echo
-    echo "============================================="
-    echo "[build] target arch: $arch"
-    echo "============================================="
+"$PYTHON" -m PyInstaller \
+    --onefile \
+    --name ucopy-server \
+    --target-arch arm64 \
+    --console \
+    --add-data "ucopy_server/static:ucopy_server/static" \
+    --collect-submodules ucopy_server \
+    --noconfirm \
+    ucopy_server/server.py
 
-    "$PYTHON" -m PyInstaller \
-        --onefile \
-        --name ucopy-server \
-        --target-arch "$arch" \
-        --console \
-        --add-data "ucopy_server/static:ucopy_server/static" \
-        --collect-submodules ucopy_server \
-        --noconfirm \
-        ucopy_server/server.py
-
-    local bin="dist/ucopy-server"
-    if [[ ! -x "$bin" ]]; then
-        echo "ERROR: 构建失败：$bin 不存在" >&2
-        exit 1
-    fi
-    file "$bin"
-    echo "[ok] $bin"
-}
-
-if [[ "${UNIVERSAL:-0}" == "1" ]]; then
-    # 通用二进制：两个 arch 都构建 + lipo 合并
-    build_one_arch arm64
-    mv dist/ucopy-server dist/ucopy-server.arm64
-    build_one_arch x86_64
-    mv dist/ucopy-server dist/ucopy-server.x86_64
-    lipo -create \
-        -arch arm64 dist/ucopy-server.arm64 \
-        -arch x86_64 dist/ucopy-server.x86_64 \
-        -output dist/ucopy-server
-    rm dist/ucopy-server.arm64 dist/ucopy-server.x86_64
-    echo
-    echo "============================================="
-    echo "[ok] 通用二进制已生成: dist/ucopy-server"
-    echo "============================================="
-    lipo -info dist/ucopy-server
-else
-    build_one_arch "$TARGET_ARCH"
-    echo
-    echo "============================================="
-    echo "[done] 单文件已生成: dist/ucopy-server"
-    echo "[usage] ./dist/ucopy-server --help"
-    echo "[usage] ./dist/ucopy-server --port 8443 --data-dir ~/UCopyServer"
-    echo "============================================="
+bin="dist/ucopy-server"
+if [[ ! -x "$bin" ]]; then
+    echo "ERROR: 构建失败：$bin 不存在" >&2
+    exit 1
 fi
+file "$bin"
 
-ls -la dist/ucopy-server
-du -sh dist/ucopy-server
+# 重命名为发布产物约定
+mv "$bin" dist/UCopy-Server-macos-arm64
+chmod +x dist/UCopy-Server-macos-arm64
+
+echo
+echo "============================================="
+echo "[done] 单文件已生成: dist/UCopy-Server-macos-arm64"
+echo "[usage] ./dist/UCopy-Server-macos-arm64 --help"
+echo "[usage] ./dist/UCopy-Server-macos-arm64 --port 8443 --data-dir ~/UCopyServer"
+echo "============================================="
+
+ls -la dist/UCopy-Server-macos-arm64
+du -sh dist/UCopy-Server-macos-arm64

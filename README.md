@@ -248,19 +248,14 @@ UCopy 可连接到一台远程服务器，把本地拷贝到的文件自动上�
 服务器代码可打包成 macOS 单文件可执行（无需 Python 环境）：
 
 ```bash
-# 当前 arch（默认 arm64）
 bash build_macos.sh
-
-# Intel Mac
-TARGET_ARCH=x86_64 bash build_macos.sh
-
-# 通用二进制（arm64 + x86_64 合一）
-UNIVERSAL=1 bash build_macos.sh
 ```
 
-产物：`dist/ucopy-server`（约 9.5MB），`./ucopy-server --help` 直接跑。
+产物：`dist/UCopy-Server-macos-arm64`（约 9.5MB），`./UCopy-Server-macos-arm64 --help` 直接跑。
 
-CI 自动构建：在 GitHub 推 tag（如 `v1.5.0`）会触发 `.github/workflows/build-server.yml`，在 macos-14 上跑 arm64 + x86_64 双矩阵，产物作为 `UCopy-Server-macos-arm64` 和 `UCopy-Server-macos-x86_64` 上传到 GitHub Release。
+**只支持 Apple Silicon（M 系列芯片）。** Intel Mac 不再支持 —— Python 3.13 + PyInstaller 6.x 无法在 M 系列机器上构建 x86_64 产物。Intel Mac 上想跑服务器只能直接用源码：`python3 ucopy_server/server.py`（需要 Python 3.9+）。
+
+CI 自动构建：推 tag（如 `v1.5.0`）会触发 `.github/workflows/build-server.yml`，在 macos-14（arm64）上构建，产物作为 `UCopy-Server-macos-arm64` 上传到 GitHub Release。
 
 ## 技术栈
 

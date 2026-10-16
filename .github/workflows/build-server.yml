@@ -14,24 +14,14 @@ on:
         description: '要发布的版本号，例如 v1.5.0（留空则只构建不发版）'
         required: false
         type: string
-      release_notes:
-        description: 'Release 说明（留空则用自动生成的）'
-        required: false
-        type: string
 
 permissions:
   contents: write
 
 jobs:
   build:
+    # Apple Silicon only（M 系列芯片）。本项目不再支持 Intel Mac。
     runs-on: macos-14
-    strategy:
-      matrix:
-        include:
-          - target_arch: arm64
-            asset_name: UCopy-Server-macos-arm64
-          - target_arch: x86_64
-            asset_name: UCopy-Server-macos-x86_64
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -47,24 +37,22 @@ jobs:
           python -m pip install pyinstaller
 
       - name: Build with PyInstaller
-        env:
-          TARGET_ARCH: ${{ matrix.target_arch }}
         run: bash build_macos.sh
 
       - name: "Smoke test: --help"
-        run: ./dist/ucopy-server --help
+        run: ./dist/UCopy-Server-macos-arm64 --help
 
       - name: "Smoke test: 实跑 + /api/v1/ping"
         run: |
           set -e
           rm -rf /tmp/ucopy_ci_server
-          ./dist/ucopy-server \
+          ./dist/UCopy-Server-macos-arm64 \
               --data-dir /tmp/ucopy_ci_server \
               --port 18443 \
               --bind-host 127.0.0.1 \
               --no-autostart &
           SERVER_PID=$!
-          # 等服务起来（首次启动要建 cert + DB；x86_64 Rosetta 翻译首次跑更慢）
+          # 等服务起来（首次启动要建 cert + DB）
           for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
               sleep 1
               if curl -sk https://127.0.0.1:18443/api/v1/ping 2>/dev/null | grep -q '"ok": true'; then
@@ -77,14 +65,11 @@ jobs:
           kill $SERVER_PID || true
           rm -rf /tmp/ucopy_ci_server
 
-      - name: Rename binary
-        run: mv dist/ucopy-server dist/${{ matrix.asset_name }} && chmod +x dist/${{ matrix.asset_name }}
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ucopy-server-macos-${{ matrix.target_arch }}
-          path: dist/${{ matrix.asset_name }}
+          name: ucopy-server-macos-arm64
+          path: dist/UCopy-Server-macos-arm64
 
   publish:
     needs: build
@@ -94,28 +79,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download arm64 artifact
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: ucopy-server-macos-arm64
-          path: dist-arm64
+          path: dist
 
-      - name: Download x86_64 artifact (if exists)
-        uses: actions/download-artifact@v4
-        with:
-          name: ucopy-server-macos-x86_64
-          path: dist-x86_64
-        continue-on-error: true
-
-      - name: Prepare assets
+      - name: Prepare asset
         shell: bash
         run: |
-          cp dist-arm64/UCopy-Server-macos-arm64 ./
+          cp dist/UCopy-Server-macos-arm64 ./
           chmod +x UCopy-Server-macos-arm64
-          if [[ -f dist-x86_64/UCopy-Server-macos-x86_64 ]]; then
-              cp dist-x86_64/UCopy-Server-macos-x86_64 ./
-              chmod +x UCopy-Server-macos-x86_64
-          fi
           ls -la
 
       - name: Publish release (tag push)
@@ -130,19 +104,11 @@ jobs:
               echo "[publish] release 已存在，upload 追加 server"
           else
               echo "[publish] release 不存在，create"
-              ASSETS="UCopy-Server-macos-arm64#UCopy-Server-macos-arm64"
-              if [[ -f UCopy-Server-macos-x86_64 ]]; then
-                  ASSETS="$ASSETS,UCopy-Server-macos-x86_64#UCopy-Server-macos-x86_64"
-              fi
-              eval "gh release create \"${{ github.ref_name }}\" $ASSETS \
-                  --title \"UCopy Server -- ${{ github.ref_name }}\" \
-                  --generate-notes"
+              gh release create "${{ github.ref_name }}" \
+                  "UCopy-Server-macos-arm64#UCopy-Server-macos-arm64" \
+                  --title "UCopy Server -- ${{ github.ref_name }}" \
+                  --generate-notes
           fi
-          if [[ -f UCopy-Server-macos-arm64 ]]; then
-              gh release upload "${{ github.ref_name }}" UCopy-Server-macos-arm64 --clobber
-          fi
-          if [[ -f UCopy-Server-macos-x86_64 ]]; then
-              gh release upload "${{ github.ref_name }}" UCopy-Server-macos-x86_64 --clobber
-          fi
+          gh release upload "${{ github.ref_name }}" UCopy-Server-macos-arm64 --clobber
           echo "[publish] final assets:"
           gh release view "${{ github.ref_name }}" --json assets --jq '.assets[] | .name'
