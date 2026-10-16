@@ -91,6 +91,9 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-14
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Download arm64 artifact
         uses: actions/download-artifact@v4
         with:
@@ -120,10 +123,26 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ASSETS="UCopy-Server-macos-arm64#UCopy-Server-macos-arm64"
-          if [[ -f UCopy-Server-macos-x86_64 ]]; then
-              ASSETS="$ASSETS,UCopy-Server-macos-x86_64#UCopy-Server-macos-x86_64"
+          set -e
+          # Windows workflow 会先 create release（带 UCopy.exe）；我们只 upload server。
+          # 如果 release 不存在（例如 Windows workflow 还未跑），fallback create。
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+              echo "[publish] release 已存在，upload 追加 server"
+          else
+              echo "[publish] release 不存在，create"
+              ASSETS="UCopy-Server-macos-arm64#UCopy-Server-macos-arm64"
+              if [[ -f UCopy-Server-macos-x86_64 ]]; then
+                  ASSETS="$ASSETS,UCopy-Server-macos-x86_64#UCopy-Server-macos-x86_64"
+              fi
+              eval "gh release create \"${{ github.ref_name }}\" $ASSETS \
+                  --title \"UCopy Server -- ${{ github.ref_name }}\" \
+                  --generate-notes"
           fi
-          eval "gh release create \"${{ github.ref_name }}\" $ASSETS \
-              --title \"UCopy Server - ${{ github.ref_name }}\" \
-              --generate-notes --verify-tag"
+          if [[ -f UCopy-Server-macos-arm64 ]]; then
+              gh release upload "${{ github.ref_name }}" UCopy-Server-macos-arm64 --clobber
+          fi
+          if [[ -f UCopy-Server-macos-x86_64 ]]; then
+              gh release upload "${{ github.ref_name }}" UCopy-Server-macos-x86_64 --clobber
+          fi
+          echo "[publish] final assets:"
+          gh release view "${{ github.ref_name }}" --json assets --jq '.assets[] | .name'
