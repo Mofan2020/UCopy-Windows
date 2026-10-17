@@ -1,279 +1,248 @@
-# UCopy - Windows 后台 U 盘自动复制工具
+# UCopy
 
-UCopy 是一个轻量级的 Windows 后台程序，当检测到 U 盘插入时，自动将 U 盘内文件复制到指定文件夹，并支持灵活的过滤规则。程序在屏幕右上角保留一个置顶的小圆点，不占用任务栏，也不需要系统托盘。
+> **A lightweight Windows background tool that automatically copies files from inserted USB drives to a folder you choose.** No system tray, no taskbar clutter — just a tiny floating dot in the top-right corner of your screen.
 
-**注意**：本项目暂停开发
+You insert a USB drive. Files copy themselves to a backup folder. You go on with your life. That's the whole product.
 
-**注意**：请谨慎使用本项目，未经他人允许私自复制/修改他人存储设备内文件属于违法行为。使用本项目造成的任何后果请自行承担，
-与本项目开发者无关。
+![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.11%2B-yellow.svg)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
----
+[中文文档](./README.zh-CN.md) · [Releases](https://github.com/Mofan2020/UCopy-Windows/releases)
 
-## 功能特性
+> **Status:** Development is currently paused on the Windows client. The companion remote server (`ucopy_server`) is still maintained.
+>
+> **⚠ Legal notice:** Do not use this tool to copy or modify storage devices that do not belong to you or that you are not explicitly authorized to access. The author takes no responsibility for misuse.
 
-- **自动检测**：基于 Windows 设备消息，实时感知 U 盘插入，无需轮询。
-- **后台静默复制**：保持原有目录结构，在目标文件夹中创建 `<卷标>_<序列号>` 子目录进行复制。
-- **可配置规则**：
-  - 目标目录必填
-  - 可限制 U 盘总文件数 / 总大小，超出阈值整盘不复制
-  - 可限制单文件大小（MB），超过则跳过
-  - 可设置目标磁盘剩余空间不足（MB）时不复制
-  - 支持文件扩展名过滤（如 `.jpg,.png`）
-  - 支持文件名正则过滤
-- **黑名单 / 白名单双模式**：二选一。黑名单模式下名单内的 U 盘不复制；白名单模式下只有名单内的 U 盘才复制。设置面板顶部可随时切换。
-- **开机自启动**（可选）：通过注册表实现，可随时开关。
-- **桌面悬浮小圆点**：屏幕右上角常驻一个置顶的紫色小圆点，**连续点击三次即可打开设置面板**，无需系统托盘。
-- **智能 diff 复制**：第二次插入同一 U 盘时，对每个目标文件按大小 + 修改时间比对；相同则跳过，不同则覆盖。不会删除目标里已有的其它文件。
-- **摄像头 / 麦克风占用指示灯**：小圆点颜色随设备占用实时变化——有程序在用摄像头显示**绿色**，只有麦克风在用显示**橙色**，都空闲显示**紫色**（类似 macOS 的隐私指示灯）。虚拟摄像头与虚拟麦克风驱动同样会被识别。
-- **设置面板密码保护**：首次使用强制设置登录密码 + 3 个密保问题；之后每次打开设置面板都需要输入密码。密码和密保答案均以 **SHA-256 + 随机盐** 哈希存储，不存明文。
-- **单文件打包**：可用 PyInstaller 打包成单个 EXE，无需 Python 环境。
+## Highlights
 
-## 截图
+- **Auto-detect** — Listens to Windows device notifications; no polling.
+- **Silent background copy** — Preserves the original directory structure; creates `<label>_<serial>` subfolders per drive.
+- **Configurable rules:**
+  - Required target directory
+  - Per-drive max file count / total size (skip the whole drive if exceeded)
+  - Per-file max size (skip oversized files)
+  - Refuse copy if target disk has less than N MB free
+  - Extension filter (e.g. `.jpg,.png`)
+  - Filename regex filter
+- **Blacklist / Whitelist dual mode** — one list, two modes. Switchable from the settings panel.
+- **Optional auto-start** via the registry; toggle on or off any time.
+- **Floating dot UI** — a tiny purple dot in the top-right corner of the screen. No tray icon. **Triple-click it** to open the settings panel.
+- **Smart diff copy** — On a second insertion of the same drive, files are compared by size + modification time; unchanged files are skipped, changed files are overwritten. Files already in the target that are no longer on the drive are kept (never deleted).
+- **Camera / microphone activity indicator** — the dot changes color in real time: green when the camera is in use, orange when only the microphone is in use, purple when both are idle. Virtual cameras (OBS Virtual Camera, ManyCam, VCAM) and virtual microphones (VB-CABLE, VoiceMeeter) are also detected.
+- **Password-protected settings panel** — first launch forces you to set a login password + 3 security questions. The panel requires the password every time it's opened. Passwords and answers are stored as **SHA-256 + per-record random salt** — never plaintext.
+- **Single-file build** — PyInstaller packages it into one EXE, no Python runtime required.
 
-> 可自行补充设置界面和桌面小圆点的截图
+## Screenshots
 
-## 安装与运行
+> To be added: settings panel + dot indicator.
 
-### 方式一：直接运行 Python 脚本
+## Install & Run
 
-1. 确保已安装 Python 3.8 或更高版本。
-2. 安装依赖：
+### Option 1: Run the Python script directly
 
-   ```bash
+1. Make sure Python 3.8+ is installed.
+2. Install the dependency:
+
+   ```sh
    pip install pywin32
    ```
 
-3. 运行程序：
+3. Run:
 
-   ```bash
+   ```sh
    python ucopy.py
    ```
 
-首次运行会先弹出 **安全设置** 窗口，要求设置登录密码和 3 个密保问题（用于找回密码）。完成后再进入设置窗口，配置后点击"保存并隐藏"。此后程序只在右上角保留一个小圆点（默认紫色，摄像头或麦克风被占用时会变色），**连续点击三次小圆点**即可再次打开设置面板。
+On first launch, a **Security Setup** window appears and forces you to set a login password and 3 security questions (used for password recovery). After that, the settings window appears — configure your rules and click "Save and Hide". From then on, the program only shows a small dot in the top-right corner of your screen (purple by default; turns green/orange when the camera or microphone is in use). **Triple-click the dot** to reopen the settings panel.
 
-### 方式二：使用预打包的 EXE
+### Option 2: Download the prebuilt EXE
 
-从 [Releases](https://github.com/Mofan2020/UCopy-Windows/releases) 页面下载 `UCopy.exe`，双击运行 EXE 即可（Windows 可能提示安全警告，允许即可）。
+Grab `UCopy.exe` from the [Releases](https://github.com/Mofan2020/UCopy-Windows/releases) page and double-click it (Windows may show a security warning — allow it).
 
-**EXE 默认就是后台静默运行**（无控制台窗口 / 任务栏图标）：
+> The prebuilt binary targets AMD64. For ARM, please build it yourself.
 
-- 启动后只在屏幕右上角显示一个紫色小圆点（约 6 像素）
-- **不会出现 cmd / PowerShell 黑窗口**
-- 关闭窗口后程序仍在后台运行（关的是小圆点提示的设置面板入口，不是程序本身）
-- 真实进程在任务管理器里可以看到 `UCopy.exe`
+## Configuration
 
-> 打包文件基于 AMD64 架构，如需 ARM 版本请自行打包。
+All settings live in `%USERPROFILE%\.ucopy_settings.json` and are edited via the settings panel:
 
-## 配置说明
+| Setting | Description |
+| --- | --- |
+| Target directory | Root directory for copied files — **required** |
+| Max file count | If the drive's total file count exceeds this, skip the whole drive; `0` = no limit |
+| Max total size (MB) | If the drive's total size exceeds this, skip the whole drive; `0` = no limit |
+| Skip files larger than (MB) | Skip individual files larger than this; `0` = no limit |
+| Target free space (MB) | Refuse copy if target disk has less than this many MB free; `0` = no limit |
+| Extensions | Comma-separated, e.g. `.jpg,.png,.pdf`; empty = no filter |
+| Filename regex | Only files matching this regex are copied; empty = no filter |
+| Auto-start on boot | Toggles a registry entry for auto-start |
+| List mode | `blacklist` or `whitelist` — choose one |
 
-所有设置保存在 `%USERPROFILE%\.ucopy_settings.json` 中，可通过设置界面修改：
+## USB Drive List (Blacklist / Whitelist)
 
-| 设置项 | 说明 |
-|--------|------|
-| 目标目录 | 文件复制的根目录，**必填** |
-| 最大文件数 | U 盘文件总数超过此值则不复制，0 表示不限制 |
-| 最大总大小(MB) | U 盘文件总大小超过此值则不复制，0 表示不限制 |
-| 跳过单文件大于(MB) | 单个文件大小超过此值则跳过，0 表示不限制 |
-| 目标空间不足(MB) | 目标磁盘剩余空间小于此值时不复制，0 表示不限制 |
-| 扩展名 | 以逗号分隔，如 `.jpg,.png,.pdf`，空表示不过滤 |
-| 文件名正则 | 符合正则表达式的文件才复制，空表示不过滤 |
-| 开机自动启动 | 勾选后写入注册表，随系统启动 |
-| 名单模式 | `blacklist` 黑名单模式 / `whitelist` 白名单模式，二选一 |
+One list, two modes. The active mode is selected from a dropdown at the top of the settings panel:
 
-## U 盘名单（黑名单 / 白名单）
+| Mode | Meaning | Drives in the list | Drives not in the list |
+| --- | --- | --- | --- |
+| **Blacklist** (default) | Listed drives are blocked | Not copied | Copied |
+| **Whitelist** | Only listed drives are copied | Copied | Not copied |
 
-程序只维护一份 U 盘名单，但**同一时刻只按其中一种模式工作**，在设置面板顶部的"工作模式"下拉框切换：
+Operation: select a drive in the list, then click "Add/Remove from Blacklist" or "Add/Remove from Whitelist". The right side of the list shows each drive's current disposition in real time (`[in blacklist]` / `[will copy]` / `[in whitelist]` / `[won't copy]`).
 
-| 模式 | 含义 | 名单内的 U 盘 | 名单外的 U 盘 |
-|------|------|----------------|----------------|
-| **黑名单模式**（默认） | 名单内的不复制 | 不复制 | 复制 |
-| **白名单模式** | 只有名单内的才复制 | 复制 | 不复制 |
-
-操作方式：选中断言列表里的 U 盘，点击"加入/移出黑名单"或"加入/移出白名单"即可切换。列表右侧会实时显示每个 U 盘当前的处理结果（`[在黑名单中]` / `[会复制]` / `[在白名单中]` / `[不复制]`）。
-
-> 切换到白名单模式后，**新插入的 U 盘默认不在白名单里，因此不会被复制**，需要手动加入白名单才会开始备份。
+> Switching to whitelist mode means **newly inserted drives are not in the whitelist and will not be copied** — you must add them manually.
 >
-> 从旧版本升级时，原黑名单中的 U 盘会自动按当前模式做语义转换，无需手动重新添加。
+> Upgrading from an older version: drives in the old blacklist are automatically reinterpreted according to the current mode.
 >
-> 切换模式**立即生效并自动保存**，不需要再点"保存并隐藏"。
+> Mode switch takes effect immediately and auto-saves — no need to click "Save and Hide".
 
-## 桌面小圆点
+## Floating Dot
 
-程序不再使用系统托盘图标。启动后屏幕右上角会出现一个**置顶的小圆点**（直径 6 像素，带抗锯齿平滑边缘）：
+No system tray icon. After launch, a small floating dot (6 px diameter, anti-aliased) sits in the top-right corner of your screen:
 
-- **连续点击三次**小圆点 → 打开设置面板（需验证密码）
-- 小圆点无边框、背景透明，不影响其他窗口操作
-- 关闭设置面板后小圆点继续驻留，程序仍在后台监听 U 盘
-- 需要退出程序时，打开设置面板点击"退出程序"
+- **Triple-click** the dot → opens the settings panel (with password)
+- The dot is borderless and transparent everywhere except the pixel; it does not block other windows
+- Closing the settings panel leaves the dot in place; the program keeps watching for USB drives
+- To exit the program, open the settings panel and click "Exit"
 
-### 小圆点颜色含义（摄像头 / 麦克风指示灯）
+### Dot Color (Camera / Microphone Indicator)
 
-程序每 1 秒检测一次设备占用情况，小圆点颜色随之变化：
+The dot is sampled once per second and changes color accordingly:
 
-| 颜色 | 含义 |
-|------|------|
-| 紫色 | 摄像头和麦克风都没有被使用 |
-| 绿色 | **有程序正在使用摄像头**（此时即使麦克风也在用，仍显示绿色） |
-| 橙色 | 摄像头没有在用，但**有程序正在使用麦克风** |
+| Color | Meaning |
+| --- | --- |
+| Purple | Neither camera nor microphone is in use |
+| Green | **A program is using the camera** (microphone state does not affect the color in this case) |
+| Orange | Camera idle, but **a program is using the microphone** |
 
-判定规则：
+Detection rules:
 
-- 只要摄像头处于使用中，就一定是绿色，麦克风状态不影响
-- 摄像头停止使用、麦克风仍在使用时，会自动切成橙色，不会错误地回到紫色
-- 摄像头和麦克风都停止使用后，才恢复紫色
-- 识别范围是**系统里的全部摄像头设备和录音设备**，因此通过虚拟驱动接入的摄像头（例如 OBS Virtual Camera、ManyCam、VCAM）和虚拟麦克风（例如 VB-CABLE、VoiceMeeter）同样会被检测到。摄像头枚举会查询 5 类 GUID（系统设备类 + 设备接口 + KS 流类别 VIDEO/CAPTURE/VIDEO），覆盖物理摄像头与绝大多数虚拟驱动。
-- Windows 没有提供官方的"设备是否被占用"接口，程序采用独占方式尝试打开设备来推断占用。对每个摄像头接口路径尝试 6 种打开组合（独占 / 读写共享 / 仅读共享 × 原路径 / 设备路径），任一次返回「共享冲突 / 设备忙 / 访问被拒绝」时判定为占用。若某个驱动完全不尊重共享语义（始终返回成功），可能在该设备被占用时漏检（这类驱动属少数，仍采用「宁可漏检不误亮灯」的保守策略）。
-- 长时间空闲（连续两次空闲采样）后自动降低检测频率（默认从 1 秒降到 5 秒），检测到设备重新被占用时立刻恢复 1 秒检测，保证首次变化延迟仍是 1 秒以内。`indicator_slowdown` 可设为 `false` 关闭降频；`indicator_active_interval` / `indicator_idle_interval` 可分别调整两个频率（单位秒，写入 `~/.ucopy_settings.json`）
-- 若连续多次探测都失败（驱动或系统暂时异常），程序会在日志里写一条 warning 说明"无法判定占用状态"，指示灯保持紫色。失败期间不会降频，确保恢复正常后能立即反映最新状态
+- Camera-in-use always shows green, regardless of microphone state.
+- When the camera stops but the microphone is still active, the color switches to orange — it does not falsely return to purple.
+- Both devices must be idle before the dot returns to purple.
+- Detection covers **all system camera and recording devices**, including virtual drivers (OBS Virtual Camera, ManyCam, VCAM, VB-CABLE, VoiceMeeter, etc.). Camera enumeration queries five GUIDs (system device class + device interface + KS streaming categories VIDEO/CAPTURE/VIDEO), covering physical cameras and the vast majority of virtual drivers.
+- Windows has no official API for "is the device in use", so UCopy probes by attempting exclusive access. For each camera interface path, six combinations are tried (exclusive / read-share / read-only-share × original path / device path); any return of "sharing violation / device busy / access denied" counts as in-use. Drivers that ignore sharing semantics (always return success) may slip through — UCopy errs on the side of "rather miss than falsely light up".
+- After long idle (two consecutive idle samples), the polling interval slows from 1 s to 5 s by default. When a device becomes busy again, polling snaps back to 1 s, so the first color change still happens within 1 s. Toggle `indicator_slowdown` to disable throttling; `indicator_active_interval` / `indicator_idle_interval` adjust the two rates (in seconds, written to `~/.ucopy_settings.json`).
+- If multiple consecutive probes fail (driver or system hiccup), UCopy writes a warning to the log and keeps the dot purple. The interval does NOT slow down during failure, so the dot reflects the real state as soon as things recover.
 
-## 安全设置
+## Security
 
-为了防止他人随意修改你的备份规则，打开设置面板需要输入密码。首次使用会强制引导你完成以下两步配置：
+To prevent anyone else from editing your backup rules, the settings panel is password-gated. First launch walks you through:
 
-1. **登录密码**：至少 4 位，用于每次打开设置面板时的身份验证。密码连续错误 5 次会临时关闭设置面板，但 U 盘后台复制与右上角小圆点不受影响。
-2. **密保问题**：必须设置 3 个，每个问题可从预设题目中选择，也可自行输入。全部答对才能重置密码。
+1. **Login password** — at least 4 characters; required every time the panel is opened.
+2. **Security questions** — 3 questions, each chosen from a preset list or written by you; answering all three correctly lets you reset the password.
 
-### 存储方式
+Five wrong password attempts close the settings panel temporarily. USB drive background copying and the floating dot are unaffected.
 
-- 密码与密保答案**永不以明文存储**，统一使用 **SHA-256 + 16 字节随机盐** 哈希后写入 `%USERPROFILE%\.ucopy_settings.json` 的 `security` 段。即使配置文件被他人读取，也无法反推出原文。
-- 密保答案在比较前会自动去除首尾空格并转为小写，因此不区分大小写。
+### Storage
 
-### 修改入口
+- Passwords and security answers are **never stored as plaintext**. They are hashed with **SHA-256 + 16-byte per-record random salt** into the `security` section of `%USERPROFILE%\.ucopy_settings.json`. Even if the config file leaks, the originals cannot be reversed.
+- Security answers are stripped of leading/trailing whitespace and lowercased before comparison, so they are case-insensitive.
 
-设置面板底部提供两个按钮：
+### Change Password / Security Questions
 
-- **修改密码**：需输入当前密码，再设置新密码（至少 4 位，需二次确认）。
-- **修改密保**：需输入当前密码，再重新设置 3 个密保问题与答案。
+The bottom of the settings panel has two buttons:
 
-### 忘记密码？
+- **Change password** — requires current password; new password must be entered twice.
+- **Change security questions** — requires current password; re-pick 3 questions and answers.
 
-在登录窗口点击"忘记密码"，依次回答 3 个密保问题，全部答对后即可设置新密码。**请妥善保管你的密保答案**，这是唯一找回密码的途径。
+### Forgot Password?
 
-## 目录结构示例
+On the login screen, click "Forgot password" and answer the 3 security questions. **Keep your answers safe — this is the only recovery path.**
 
-假设目标目录为 `D:\Backup`，U 盘卷标 `MyDrive`，序列号 `1234ABCD`，复制后的文件结构如下：
+## Backup Folder Layout
+
+Given a target directory `D:\Backup`, drive label `MyDrive`, serial `1234ABCD`:
 
 ```
 D:\Backup\MyDrive_1234ABCD\
-├── 文档\
-│   └── 报告.docx
-├── 照片\
-│   └── 风景.jpg
+├── Documents\
+│   └── report.docx
+├── Photos\
+│   └── landscape.jpg
 └── ...
 ```
 
-## 自行打包
+## Building from Source
 
-使用 PyInstaller 打包为单个 EXE：
+PyInstaller packages it into a single EXE:
 
-```bash
+```sh
 pip install pyinstaller
 pyinstaller --onefile --windowed --name UCopy --icon assets/blank.ico ucopy.py
 ```
 
-生成的文件在 `dist\UCopy.exe`。`assets/blank.ico` 是一个**完全透明（全 0 像素）**的图标，用于避免 EXE 使用 PyInstaller 自带的默认图标。
+Output: `dist\UCopy.exe`. `assets/blank.ico` is a **fully transparent** (all-zero pixel) icon used to avoid the PyInstaller default icon.
 
-### 利用 GitHub Actions 自动构建
+### GitHub Actions Auto-Build
 
-仓库已包含 `.github/workflows/build.yml`，每次推送代码会自动在 AMD64 Windows 环境中构建，构建产物可在 Actions 页面下载。
+`.github/workflows/build.yml` builds on every push using an AMD64 Windows runner; artifacts are downloadable from the Actions page.
 
-## 常见问题
+## Remote Mode (v1.5.0+)
 
-**Q: 程序启动后没有界面？**  
-A: 正常现象。程序常驻后台，屏幕右上角有一个**紫色小圆点**，连续点击三次即可打开设置面板。首次启动会自动弹出安全设置窗口，要求设置密码与密保。
+UCopy can connect to a remote server, automatically upload the files it copies locally, and sync configuration across machines.
 
-**Q: 右上角的紫色小圆点不见了？**  
-A: 检查是否有其他置顶窗口盖住了它。程序启动后小圆点应固定在主屏幕右上角。若刚开机自启失败，注销重登或手动双击运行 `UCopy.exe` 即可。
+### Enable
 
-**Q: 怎么退出 UCopy？**  
-A: 连续点击三次紫色小圆点打开设置面板，点击底部的"退出程序"。
+1. **Start the server.** On the remote machine, run `ucopy_server` (a separate Python program, not bundled with the UCopy EXE):
 
-**Q: 复制的文件覆盖了原有文件？**  
-A: 不会无脑覆盖。每次插入 U 盘时，程序按「文件大小 + 修改时间」对目标里已存在的同名文件做 diff：相同则跳过（不再重写），不同才覆盖。目标里**有但 U 盘里没有的文件会保留**，不会清理。
-
-**Q: 第二次插入同一个 U 盘还要全部重写一遍吗？**  
-A: 不需要。如果源文件的大小和修改时间与目标里已存在的副本一致（容差 1 秒，应对 FAT32 / U 盘控制器时间戳精度），程序会自动跳过。修改过的文件才会被覆盖复制。
-
-**Q: 开机自启无效？**  
-A: 请以**非管理员**权限运行程序，注册表写入路径为 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`。若仍无效，可手动添加。
-
-**Q: 忘记登录密码怎么办？**  
-A: 在登录窗口点击"忘记密码"，依次正确回答 3 个密保问题后即可重置新密码。密保答案不区分大小写且自动去除首尾空格。**密保问题和密码同样重要，请务必牢记。**
-
-**Q: 密码和密保答案是明文保存吗？**  
-A: 不是。所有敏感信息都以 **SHA-256 + 随机盐** 哈希后存入 `%USERPROFILE%\.ucopy_settings.json` 的 `security` 段，配置文件本身不包含明文密码。删除该文件后下次启动会重新要求设置密码与密保。
-
-**Q: 输入了 5 次错误密码会怎样？**  
-A: 为防止暴力破解，连续 5 次密码错误后会**关闭设置面板**，但 U 盘后台复制功能与右上角小圆点不受影响，仍在正常运行。每次错误与触顶事件都会写入日志，需要时可再次点击三次小圆点重试。
-
-## 远程模式（v1.5.0+）
-
-UCopy 可连接到一台远程服务器，把本地拷贝到的文件自动上传上去，并在多台机器之间同步配置。
-
-### 启用步骤
-
-1. 在远程服务器上启动 `ucopy_server`（独立 Python 程序，与 UCopy 主程序不打包在一起）：
-   ```
+   ```sh
    python3 ucopy_server/server.py
    ```
-   首次启动会生成自签证书 + 初始管理员账号（密码随机，打印到终端）。支持 HTTPS（自签证书）、双栈监听（IPv4 + IPv6）、多用户、配额、launchd 自启动（macOS）、Web GUI（在服务器 `static/index.html`）。
 
-2. 在 UCopy 设置面板打开「远程模式」LabelFrame：
-   - 填写服务器地址（如 `https://[2609::1]:8443` 或 `https://example.com:8443`）
-   - 填写用户名 + 服务器密码（**密码不存盘**，仅本会话有效）
-   - 勾选「启用远程模式」→ 弹出三项强制确认弹窗（三项 checkbox 全部勾选才能启用）：
-     1. 我仅将本工具用于合法用途，因滥用产生的全部责任由我本人承担
-     2. 我没有受到欺骗或诱导而启用此模式
-     3. 我已确认服务器地址正确，且服务器有足够空间存储上传的文件
+   First launch generates a self-signed certificate + initial admin account (random password printed to the terminal). Features: HTTPS (self-signed), dual-stack listening (IPv4 + IPv6), multi-user, quotas, launchd auto-start (macOS), web GUI (`static/index.html` on the server).
 
-3. 第一次连服务器会弹出「信任自签证书」对话框（显示证书指纹）→ 确认后存到 `~/.ucopy_trusted_servers.json`，以后不再提示。
+2. **Open the "Remote Mode" section** in UCopy's settings panel:
+   - Server address (e.g. `https://[2609::1]:8443` or `https://example.com:8443`)
+   - Username + server password (the password is **never written to disk**, session-only)
+   - Tick "Enable Remote Mode" → three mandatory confirmation dialogs appear (all three checkboxes must be ticked to enable):
+     1. I will only use this tool for lawful purposes; all liability for misuse rests with me.
+     2. I am not being deceived or induced into enabling this mode.
+     3. I have confirmed the server address is correct and that the server has enough storage for my uploads.
 
-4. 设置面板的「测试连接」按钮：填好服务器信息后点一下，验证用户名/密码 + 证书指纹是否正确（成功弹窗显示用户名、角色、配额；失败显示错误码 + 错误信息）。这是启用前的最稳妥的检查方式。
+3. **First connection** shows a "Trust self-signed certificate" dialog (with the cert fingerprint). After confirmation, the fingerprint is saved to `~/.ucopy_trusted_servers.json` and not prompted again.
 
-5. 改服务器密码：登录 Web GUI（`https://server:8443/`）→ 「修改我的密码」卡片（自己改）→ 旧密码 + 新密码 × 2 → 提交后自动登出，要用新密码重登。**admin 角色** 在「用户管理」表格里每行有「改密码」按钮，可直接给其他用户重置密码（不需要旧密码）；非 admin 角色看不到该按钮。
+4. **After every USB copy**, a background thread uploads the files that pass the `extensions / regex_pattern / max_single_file_mb` filter to the server. SHA-256 dedup avoids retransfers.
 
-6. 之后每次插入 U 盘复制完文件，UCopy 后台线程会自动把符合 `extensions / regex_pattern / max_single_file_mb` 过滤的文件上传到服务器。先按 sha256 比对，相同不重传。
+### Server Configuration
 
-### 服务器配置
+| Item | Default | Notes |
+| --- | --- | --- |
+| Port | 8443 | HTTPS port |
+| Data directory | `~/UCopyServer/` | User files + SQLite + self-signed cert |
+| Initial admin | `admin` | Random password printed to terminal on first launch |
+| Quota | 10 GB/user (admin unlimited) | Excess returns HTTP 413 |
+| launchd auto-start | macOS: enabled on first launch | `~/Library/LaunchAgents/com.skyc8266.ucopy-server.plist` |
 
-| 配置项 | 默认值 | 说明 |
-|---|---|---|
-| 端口 | 8443 | HTTPS 端口 |
-| 数据目录 | `~/UCopyServer/` | 用户文件 + SQLite + 自签证书 |
-| 初始管理员 | admin | 首次启动随机生成密码到终端 |
-| 配额 | 10GB/用户（admin 不限） | 超出返回 413 |
-| launchd 自启动 | macOS 首次启动自动 | `~/Library/LaunchAgents/com.skyc8266.ucopy-server.plist` |
+### Security
 
-### 安全说明
+- Client → server: HTTPS with self-signed certificate; after the first trust, the cert fingerprint is pinned (defends against MITM).
+- Config sync: password and security-question SHA-256 hashes are **never transmitted** (stripped both on the client and the server side).
+- Server password: lives only in the in-memory session, lost when UCopy exits; re-enter on next enable.
 
-- 客户端 → 服务端：HTTPS（自签证书，首次信任后按 fingerprint pinning 校验，避免 MITM）。
-- 配置文件同步：密码、密保的 SHA-256 哈希**永不传输**（客户端 + 服务端双层剥除）。
-- 服务器密码：只在本会话内存中，关闭 UCopy 后丢失；下次启用需重新输入。
+### Protocol Contract
 
-### 协议契约
+Full API spec: [`ucopy_server/PROTOCOL.md`](ucopy_server/PROTOCOL.md).
 
-完整 API 契约见 [`ucopy_server/PROTOCOL.md`](ucopy_server/PROTOCOL.md)。
+### macOS Single-File Build
 
-### macOS 单文件打包
+The server code can be packaged into a macOS single-file binary (no Python needed):
 
-服务器代码可打包成 macOS 单文件可执行（无需 Python 环境）：
-
-```bash
+```sh
 bash build_macos.sh
 ```
 
-产物：`dist/UCopy-Server-macos-arm64`（约 9.5MB），`./UCopy-Server-macos-arm64 --help` 直接跑。
+Output: `dist/UCopy-Server-macos-arm64` (~9.5 MB). Run it with `./UCopy-Server-macos-arm64 --help`.
 
-**只支持 Apple Silicon（M 系列芯片）。** Intel Mac 不再支持 —— Python 3.13 + PyInstaller 6.x 无法在 M 系列机器上构建 x86_64 产物。Intel Mac 上想跑服务器只能直接用源码：`python3 ucopy_server/server.py`（需要 Python 3.9+）。
+**Apple Silicon only (M-series).** Intel Macs are not supported — Python 3.13 + PyInstaller 6.x cannot produce x86_64 binaries from an M-series machine. To run the server on Intel, use the source: `python3 ucopy_server/server.py` (Python 3.9+ required).
 
-CI 自动构建：推 tag（如 `v1.5.0`）会触发 `.github/workflows/build-server.yml`，在 macos-14（arm64）上构建，产物作为 `UCopy-Server-macos-arm64` 上传到 GitHub Release。
+CI: pushing a tag (e.g. `v1.5.0`) triggers `.github/workflows/build-server.yml`, which builds on `macos-14` (arm64) and uploads the artifact `UCopy-Server-macos-arm64` to the GitHub Release.
 
-## 技术栈
+## Tech Stack
 
 - Python 3.11+
-- `pywin32` – Windows API 调用
-- `tkinter` – GUI 设置界面与桌面悬浮小圆点
-- `ctypes` – 摄像头/麦克风占用检测（SetupAPI + winmm，无新增第三方依赖）
-- `hashlib` + `secrets` – 密码与密保答案的 SHA-256 加盐哈希
-- `http.server` + `sqlite3` + `ssl` (stdlib) – 远程模式配套服务器（不引第三方依赖）
-- `PyInstaller` – 打包
+- `pywin32` — Windows API calls
+- `tkinter` — Settings GUI + floating dot
+- `ctypes` — Camera/microphone detection (SetupAPI + winmm; no extra dependencies)
+- `hashlib` + `secrets` — Password and security-answer SHA-256 salted hashing
+- `http.server` + `sqlite3` + `ssl` (stdlib) — Companion remote server (no third-party deps)
+- `PyInstaller` — Packaging
