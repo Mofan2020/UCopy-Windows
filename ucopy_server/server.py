@@ -751,6 +751,13 @@ def _server_address_family(bind_host: str):
     return _socket.AF_INET
 
 
+def _strip_brackets(host: str) -> str:
+    """剥 IPv6 字面值的方括号：[::] -> ::；裸 :: 不动。"""
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
 def _enable_ipv6_dual_stack(sock):
     """给 IPv6 socket 开 IPV6_V6ONLY=0，让 :: 通配同时接受 IPv4 mapped。"""
     import socket as _socket
@@ -762,9 +769,20 @@ def _enable_ipv6_dual_stack(sock):
 
 
 class ThreadingHTTPSServer(ThreadingHTTPServer):
-    """Python 3.7+ 的 ThreadingHTTPServer 已经线程化了，继承即可用。"""
+    """Python 3.7+ 的 ThreadingHTTPServer 已经线程化了，继承即可用。
+
+    重写 __init__ 是为了在调用 socketserver.TCPServer.__init__ 之前
+    先把 [::] 剥成裸 ::（macOS getaddrinfo('[::]', port) 报 Errno 8）。
+    """
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(self, server_address, RequestHandlerClass, bind_host=None):
+        # 关键：socketserver 内部会对 server_address 调 getaddrinfo
+        # 用户写 --bind-host '[::]' 时会报 gaierror(8)。这里把方括号剥掉再传进去。
+        if bind_host is not None and server_address[0] == bind_host and ":" in bind_host:
+            server_address = (_strip_brackets(bind_host), server_address[1])
+        super().__init__(server_address, RequestHandlerClass)
 
     def server_bind(self):
         # 在 bind() 之前开 IPV6_V6ONLY=0，让 :: 通配同时接受 v4 mapped
@@ -804,24 +822,26 @@ def run():
         ok = launchd.install(f"{sys.executable} {os.path.abspath(__file__)}")
         LOG.info(f"[launchd] 注册{'成功' if ok else '失败'}")
 
-    # 根据 bind_host 选 AF（'0.0.0.0'→AF_INET，'[::]'→AF_INET6 双栈）
-    ThreadingHTTPServer.address_family = _server_address_family(cfg["bind_host"])
-    bind = (cfg["bind_host"], int(cfg["port"]))
+    # 默认 IPv6 双栈（`::` + IPV6_V6ONLY=0），用户也可传 [::] / 具体 IPv6 / 0.0.0.0
+    ThreadingHTTPSServer.address_family = _server_address_family(cfg["bind_host"])
+    bind_host_for_socket = cfg["bind_host"]
+    bind = (bind_host_for_socket, int(cfg["port"]))
     try:
-        httpd = ThreadingHTTPServer(bind, UCRequestHandler)
+        httpd = ThreadingHTTPSServer(bind, UCRequestHandler, bind_host=bind_host_for_socket)
     except OSError as e:
         LOG.error(f"绑定 {cfg['bind_host']}:{cfg['port']} 失败: {e}")
         LOG.error("提示：--bind-host 可设为：")
-        LOG.error("  0.0.0.0            # IPv4 通配（默认）")
-        LOG.error("  127.0.0.1          # 仅本机")
-        LOG.error("  本机具体 IP        # 仅该 IP（防火墙/转发需要）")
-        LOG.error("  [::] 或具体 IPv6   # IPv6；先确认地址在本机网卡上")
+        LOG.error("  :: / [::]         # IPv4+IPv6 双栈（默认）")
+        LOG.error("  0.0.0.0           # 仅 IPv4")
+        LOG.error("  127.0.0.1         # 仅本机 IPv4")
+        LOG.error("  具体 IPv6         # 如 2409:8a1e:...（不依赖 hosts）")
         sys.exit(1)
     httpd = make_server(cfg, httpd)
 
-    LOG.info(f"UCopy Server 启动: https://[{cfg['bind_host']}]:{cfg['port']}")
+    bind_disp = f"[{cfg['bind_host']}]" if ":" in cfg["bind_host"] else cfg["bind_host"]
+    LOG.info(f"UCopy Server 启动: https://{bind_disp}:{cfg['port']}")
     LOG.info(f"数据目录: {cfg['data_dir']}")
-    LOG.info(f"Web GUI:   https://localhost:{cfg['port']}/")
+    LOG.info(f"Web GUI:   https://localhost:{cfg['port']}/（双栈 → 也能用 https://127.0.0.1:{cfg['port']}/）")
 
     def _shutdown(*_):
         LOG.info("收到退出信号，正在关闭...")

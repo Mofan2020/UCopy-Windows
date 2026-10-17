@@ -359,4 +359,10 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
 - **客户端 sha256 缓存**：每次上传前都重算 sha256（~100MB/s，无 IO 瓶颈但 CPU 浪费）。可后续加 file_hash_cache。
 - **服务端媒体预览**：Web GUI 文件列表不显示缩略图 / 视频预览（raw video / mp4 不在范围内）。
 - **摄像头/麦克风检测改进**：kernel filter driver 漏检（pitfall #17）未处理，超出范围；按用户原话"修不了就算了，一切问题都怪微软！"。
-- **v1.5.0 → v1.5.1 macOS 绑定 fix**：默认 `bind-host` 从 `'::'` 改为 `'0.0.0.0'`。原默认在 macOS 上依赖 `/etc/hosts` 有 `::1 localhost` 才能解析 `getaddrinfo('::', port)`，否则报 `Errno 8 nodename nor servname provided` 直接 exit。普通用户不该被要求改 hosts。**IPv6 仍支持**：`[::]` 或具体 IPv6 地址（如 `2409:8a1e:...`）能正常监听；为此改 `ThreadingHTTPServer.address_family` 按 hostname 含 `:` 自动切 `AF_INET6` + `IPV6_V6ONLY=0` 实现双栈。
+- **v1.5.0 → v1.5.1 macOS 绑定 fix**：
+  - **默认 `bind-host` 改回 `'::'`（IPv6 双栈）**，通过 `IPV6_V6ONLY=0` 让 `[::]` 通配同时接受 IPv4 mapped
+  - macOS 上 `getaddrinfo('[::]', port)` 报 `Errno 8`（用户原报错路径），所以 `ThreadingHTTPServer.__init__` 重写：检测 `bind_host` 是 `[::]` 时先剥成裸 `::` 再喂给 `TCPServer.__init__`
+  - `ThreadingHTTPServer.server_bind` 之前开 `IPV6_V6ONLY=0`
+  - 绑定错误提示改成 5 行可读（含 v4-only、v6-only、双栈、具体地址场景）
+  - 启动日志里 IPv6 hostname 自动加方括号
+- **v1.5.0 旧二进制下载的用户**：先 `./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer --print-admin-password` 拿回旧 admin 密码，下载新二进制覆盖后再起；或 `--init-only` 重生数据。
