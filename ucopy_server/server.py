@@ -48,6 +48,23 @@ PARENT = os.path.dirname(THIS_DIR)
 if PARENT not in sys.path:
     sys.path.insert(0, PARENT)
 
+# PyInstaller onefile 模式下，--add-data 的 ucopy_server/static 解压到
+# sys._MEIPASS/ucopy_server/static；源码运行时用 THIS_DIR/static。
+# 这里解析出一份"能用"的 STATIC_DIR 路径（运行时选其一）。
+def _resolve_static_dir() -> str:
+    candidates = []
+    if hasattr(sys, "_MEIPASS"):
+        # onefile 解压目录里的 ucopy_server/static
+        candidates.append(os.path.join(sys._MEIPASS, "ucopy_server", "static"))
+    candidates.append(os.path.join(THIS_DIR, "static"))
+    for c in candidates:
+        if os.path.isfile(os.path.join(c, "index.html")):
+            return c
+    # 找不到就回退到第一个候选（让 _serve_index 报 404 时消息更准确）
+    return candidates[0]
+
+STATIC_DIR = _resolve_static_dir()
+
 try:
     from ucopy_server import db, auth, storage, launchd, cert
 except ImportError:
@@ -681,7 +698,7 @@ class UCRequestHandler(BaseHTTPRequestHandler):
         # 安全：拒绝 .. / 绝对
         if ".." in path.split("/") or path.startswith("/"):
             return self._err(404, "not_found", "no such path")
-        static_dir = os.path.join(THIS_DIR, "static")
+        static_dir = STATIC_DIR
         if not path:
             return self._serve_index()
         full = os.path.join(static_dir, path)
@@ -702,8 +719,7 @@ class UCRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_index(self):
         # 简单的 SPA：所有非 /api/v1/* 请求都返回 index.html
-        # index.html 在 static/ 下
-        index_path = os.path.join(THIS_DIR, "static", "index.html")
+        index_path = os.path.join(STATIC_DIR, "index.html")
         if not os.path.exists(index_path):
             return self._err(404, "not_found", "Web GUI 未安装（static/index.html 不存在）")
         with open(index_path, "rb") as f:

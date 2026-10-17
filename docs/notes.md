@@ -365,4 +365,9 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
   - `ThreadingHTTPServer.server_bind` 之前开 `IPV6_V6ONLY=0`
   - 绑定错误提示改成 5 行可读（含 v4-only、v6-only、双栈、具体地址场景）
   - 启动日志里 IPv6 hostname 自动加方括号
+- **v1.5.0 → v1.5.1 Web GUI 404 fix**（**严重**，未在 v1.5.1 release 内修）：
+  - `server.py` 原来用 `os.path.join(THIS_DIR, "static")` 找 `index.html`，但在 PyInstaller onefile 模式下 `__file__` 指向解压临时目录（只有 `ucopy_server/server.py`），`ucopy_server/static/` 在 `sys._MEIPASS/ucopy_server/static/`
+  - 修法：加 `_resolve_static_dir()` 优先查 `sys._MEIPASS/ucopy_server/static`，fallback 源码运行的 `THIS_DIR/static`；`STATIC_DIR` 模块级常量
+  - 之前 v1.5.1 的端到端测试只测 API（`/api/v1/ping`），没测 Web GUI `/`，所以漏检
+  - 教训：onefile 打包后必须测**全路径**（HTML / 静态资源 / API），不能只看 API 通就认为 OK
 - **v1.5.0 旧二进制下载的用户**：先 `./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer --print-admin-password` 拿回旧 admin 密码，下载新二进制覆盖后再起；或 `--init-only` 重生数据。
