@@ -2,7 +2,7 @@
 ucopy-server/db.py
 ==================
 
-SQLite 数据访问层（users / sessions / per-user config / file metadata）。
+SQLite 数据访问层（users / sessions / per-user config / file metadata / api keys）。
 
 线程模型：
     sqlite3.connect(check_same_thread=False) + 每个请求拿新连接。
@@ -41,10 +41,26 @@ SQLite 数据访问层（users / sessions / per-user config / file metadata）�
         PRIMARY KEY (username, rel_path)
     )
 
+    api_keys (                                       -- v1.6.0 新增
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL UNIQUE,     -- sha256(key_token)
+        secret_hash TEXT NOT NULL,            -- pbkdf2(key_secret, salt)
+        secret_salt TEXT NOT NULL,
+        name TEXT NOT NULL,
+        current_client_id TEXT,               -- 当前占用 key 的 client_id（exclusive lock）
+        last_heartbeat_at REAL,               -- 上次心跳时间戳（unix time）
+        created_at REAL NOT NULL
+    )
+    INDEX idx_keys_user ON api_keys(username);
+
 注意：
     - rel_path 不允许含 '..' 或绝对路径前缀（用 storage.normalize_rel_path 校验）
     - 用户文件本体存在文件系统上（<data_dir>/files/<username>/<rel_path>）
     - file_index 是元数据缓存：实际校验以磁盘为准，元数据丢失时重建
+    - api_keys 是 server 端 API 认证的长期凭据；登录用 key 而不是 user password
+    - key 是 user 自己创建；user 也只能看到自己创建的 keys
+    - 心跳机制：客户端每 40s 发一次；2 分钟没心跳 → 锁自动释放
 """
 
 from __future__ import annotations
@@ -53,7 +69,7 @@ import json
 import os
 import sqlite3
 import time
-from typing import Optional
+from typing import Optional, Iterable, List, Dict, Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -87,6 +103,19 @@ CREATE TABLE IF NOT EXISTS file_index (
     PRIMARY KEY (username, rel_path)
 );
 CREATE INDEX IF NOT EXISTS idx_file_index_user ON file_index(username);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    secret_hash TEXT NOT NULL,
+    secret_salt TEXT NOT NULL,
+    name TEXT NOT NULL,
+    current_client_id TEXT,
+    last_heartbeat_at REAL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(username);
 """
 
 
@@ -335,3 +364,120 @@ def list_dirs(conn, username: str, rel_dir: str):
             "sha256": None,
         })
     return out
+
+
+# ---------- api_keys (v1.6.0) ----------
+
+def add_api_key(conn, username: str, token_hash: str,
+                secret_hash: str, secret_salt: str, name: str) -> int:
+    """创建 key。返回 key id。"""
+    cur = conn.execute(
+        "INSERT INTO api_keys(username, token_hash, secret_hash, "
+        "secret_salt, name, created_at) VALUES (?,?,?,?,?,?)",
+        (username, token_hash, secret_hash, secret_salt, name,
+         time.time()),
+    )
+    return int(cur.lastrowid)
+
+
+def get_api_key_by_token(conn, token_hash: str):
+    """按 token_hash 查（不含 secret_hash，返回时主动剥除防泄露）。"""
+    return conn.execute(
+        "SELECT id, username, token_hash, secret_hash, secret_salt, name, "
+        "current_client_id, last_heartbeat_at, created_at "
+        "FROM api_keys WHERE token_hash = ?", (token_hash,)
+    ).fetchone()
+
+
+def get_api_key_by_id(conn, key_id: int, username: str):
+    """按 id + username 查（防止越权看别人的 key）。"""
+    return conn.execute(
+        "SELECT id, username, name, current_client_id, last_heartbeat_at, "
+        "created_at FROM api_keys WHERE id = ? AND username = ?",
+        (key_id, username),
+    ).fetchone()
+
+
+def list_api_keys(conn, username: str):
+    """列出 username 的所有 key（不含 secret_hash / token_hash / secret_salt）。"""
+    rows = conn.execute(
+        "SELECT id, name, current_client_id, last_heartbeat_at, created_at "
+        "FROM api_keys WHERE username = ? ORDER BY created_at DESC",
+        (username,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_api_key(conn, key_id: int, username: str) -> int:
+    """删除 key（按 id + username 防越权）。返回受影响行数。"""
+    cur = conn.execute(
+        "DELETE FROM api_keys WHERE id = ? AND username = ?",
+        (key_id, username),
+    )
+    return cur.rowcount or 0
+
+
+def claim_api_key_lock(conn, key_id: int, username: str, client_id: str,
+                       now: float | None = None) -> bool:
+    """独占锁：current_client_id = client_id 且 last_heartbeat_at = now。
+
+    返回 True 表示获得锁（含抢占式：同 key 已有 current_client_id
+    也允许抢占，新 client_id 接管 + 更新 last_heartbeat_at）。
+    返回 False 表示 key 不存在 / 不属于 username。
+    """
+    if now is None:
+        now = time.time()
+    cur = conn.execute(
+        "UPDATE api_keys SET current_client_id = ?, last_heartbeat_at = ? "
+        "WHERE id = ? AND username = ?",
+        (client_id, now, key_id, username),
+    )
+    return (cur.rowcount or 0) > 0
+
+
+def update_api_key_heartbeat(conn, key_id: int, username: str, client_id: str,
+                              now: float | None = None) -> bool:
+    """心跳：必须 client_id 匹配才更新；不匹配返回 False（被踢了）。"""
+    if now is None:
+        now = time.time()
+    cur = conn.execute(
+        "UPDATE api_keys SET last_heartbeat_at = ? "
+        "WHERE id = ? AND username = ? AND current_client_id = ?",
+        (now, key_id, username, client_id),
+    )
+    return (cur.rowcount or 0) > 0
+
+
+def release_api_key_lock(conn, key_id: int, username: str, client_id: str) -> int:
+    """释放锁（client_id 匹配才清；防止误清别人的锁）。"""
+    cur = conn.execute(
+        "UPDATE api_keys SET current_client_id = NULL, last_heartbeat_at = NULL "
+        "WHERE id = ? AND username = ? AND current_client_id = ?",
+        (key_id, username, client_id),
+    )
+    return cur.rowcount or 0
+
+
+def purge_stale_api_key_locks(conn, lock_timeout_seconds: float = 120.0,
+                              now: float | None = None) -> int:
+    """清理 stale 锁：last_heartbeat_at 超过 timeout 秒 → 释放。
+
+    每次请求顺手跑（单条 UPDATE 副作用小）。"""
+    if now is None:
+        now = time.time()
+    cutoff = now - lock_timeout_seconds
+    cur = conn.execute(
+        "UPDATE api_keys SET current_client_id = NULL, last_heartbeat_at = NULL "
+        "WHERE current_client_id IS NOT NULL AND last_heartbeat_at < ?",
+        (cutoff,),
+    )
+    return cur.rowcount or 0
+
+
+def update_api_key_name(conn, key_id: int, username: str, name: str) -> int:
+    """改名（v1.6.0 可选；保留 API 但 Web GUI 不暴露）。"""
+    cur = conn.execute(
+        "UPDATE api_keys SET name = ? WHERE id = ? AND username = ?",
+        (name, key_id, username),
+    )
+    return cur.rowcount or 0

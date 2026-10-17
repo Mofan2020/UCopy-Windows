@@ -69,13 +69,17 @@ DEFAULT_CONFIG = {
     "indicator_slowdown": True,
     "indicator_active_interval": 1.0,
     "indicator_idle_interval": 5.0,
-    # 远程模式（v1.5.0+）：连接远程服务器上传拷贝到的文件 + 同步配置
+    # 远程模式（v1.6.0）：用 API key 连接远程服务器上传拷贝到的文件 + 同步配置
     "remote": {
         "enabled": False,
         "server_url": "",
-        "username": "",
+        # v1.6.0：本机名称（显示在服务器 Web GUI 的「使用中」状态，也是独占锁的 client_id）
+        "client_name": "",
         # 自动上传拷贝到本地的文件（受 extensions/regex_pattern/max_single_file_mb 过滤）
         "auto_upload": True,
+        # v1.6.0：API key 的加密存储串（DPAPI / Keychain / 机器绑定 AES）。
+        # 不含明文 key —— 真正的值由 ucopy_credentials 模块管理
+        "api_key_enc": "",
         # 远程服务器 TLS 证书指纹（SHA-256 DER hex），首次信任后由客户端持久化
         # 这里只保存一份"上次信任的指纹"用于 UI 显示；实际信任列表在 ~/.ucopy_trusted_servers.json
         "trusted_fingerprint": "",
@@ -172,8 +176,9 @@ def get_config():
         for k, default in (
             ("enabled", False),
             ("server_url", ""),
-            ("username", ""),
+            ("client_name", ""),
             ("auto_upload", True),
+            ("api_key_enc", ""),
             ("trusted_fingerprint", ""),
             ("last_error", ""),
             ("last_upload_at", ""),
@@ -184,7 +189,11 @@ def get_config():
         rem["enabled"] = bool(rem.get("enabled"))
         rem["auto_upload"] = bool(rem.get("auto_upload"))
         rem["server_url"] = str(rem.get("server_url") or "")
-        rem["username"] = str(rem.get("username") or "")
+        rem["client_name"] = str(rem.get("client_name") or "")
+        rem["api_key_enc"] = str(rem.get("api_key_enc") or "")
+        # v1.6.0: 移除已废弃的 username 字段（v1.5.x 用）
+        rem.pop("username", None)
+        rem.pop("password", None)
         # 旧版本用 blacklisted 字段表示"在黑名单里"，迁移成通用的 listed。
         # 迁移必须结合当前模式：白名单模式下 listed 的含义与 blacklisted 相反。
         mode = cfg["device_list_mode"]
@@ -222,6 +231,75 @@ def save_config(cfg):
         except Exception:
             pass
         raise
+
+
+# ---------- v1.6.0: API key 加密存储（DPAPI / Keychain / machine-bound） ----------
+
+def _default_client_id() -> str:
+    """默认客户端标识：机器名 + 短随机后缀（保证同机多名进程不冲突）。"""
+    try:
+        import socket as _s
+        host = (_s.gethostname() or "ucopy").strip() or "ucopy"
+    except Exception:
+        host = "ucopy"
+    # 取 hostname 前 40 字符，去掉非法字符
+    safe = "".join(ch for ch in host if ch.isalnum() or ch in "-_.")
+    return (safe or "ucopy")[:64]
+
+
+def _remote_key_account(cfg) -> str:
+    """Keychain/DPAPI 的 account 名：服务器地址 + 客户端名，避免多服务器混淆。"""
+    rem = (cfg or {}).get("remote", {}) or {}
+    url = (rem.get("server_url") or "").strip() or "default"
+    name = (rem.get("client_name") or "").strip() or "ucopy"
+    return f"{url}|{name}"
+
+
+def load_remote_key(cfg) -> str:
+    """从加密存储读 API key；失败返回空串。"""
+    try:
+        rem = (cfg or {}).get("remote", {}) or {}
+        blob = rem.get("api_key_enc") or ""
+        if not blob:
+            return ""
+        import ucopy_credentials as _cred
+        return _cred.load_secret(_remote_key_account(cfg), blob) or ""
+    except Exception:
+        return ""
+
+
+def save_remote_key(cfg, api_key: str) -> bool:
+    """把 API key 加密后写进 cfg["remote"]["api_key_enc"]。
+
+    返回 True 表示已安全保存；False 表示加密后端不可用（调用方**不应**明文存）。
+    注意：这里只改内存 cfg，写盘由调用方 save_config。
+    """
+    if not api_key:
+        return False
+    try:
+        import ucopy_credentials as _cred
+        if not _cred.is_supported():
+            return False
+        blob = _cred.save_secret(_remote_key_account(cfg), api_key)
+        if not blob:
+            return False
+        cfg.setdefault("remote", {})["api_key_enc"] = blob
+        return True
+    except Exception:
+        return False
+
+
+def clear_remote_key(cfg) -> None:
+    """清掉存储的 key。"""
+    try:
+        import ucopy_credentials as _cred
+        rem = (cfg or {}).get("remote", {}) or {}
+        blob = rem.get("api_key_enc") or ""
+        if blob:
+            _cred.delete_secret(_remote_key_account(cfg), blob)
+        rem.pop("api_key_enc", None)
+    except Exception:
+        pass
 
 def set_auto_start(enable):
     key = win32api.RegOpenKey(
@@ -544,8 +622,8 @@ class RemoteUploader:
       - 每次上传前调 client.check_sha256；相同跳过（节省带宽）
       - 上传失败重试 3 次（指数退避 1s / 2s / 4s）
       - 任何异常写 self.last_error + logger.warning；不弹窗（规则：自启动路径不弹）
-      - 登录失败（401）→ 暂停 5s 后重试一次；再失败 → 停 queue 直到 set_enabled(True)
-      - 不存密码：每次 login 用 self.password（UI 层注入）
+      - v1.6.0: 用 API key 认证（不再用 username/password）
+      - v1.6.0: 心跳线程每 40s 一次保独占锁；失败 5s 重试；410 = 被别人接管
     """
 
     def __init__(self, app):
@@ -554,8 +632,8 @@ class RemoteUploader:
         self.stop_event = threading.Event()
         self.thread = None
         self.client = None
-        self.username = ""
-        self.password = ""
+        self.api_key = ""          # v1.6.0 替代 username/password
+        self.client_id = ""        # v1.6.0 本机标识（独占锁用）
         self.server_url = ""
         self.enabled = False  # 远程模式总开关
         self.auto_upload = True
@@ -564,23 +642,32 @@ class RemoteUploader:
         self.uploaded_count = 0
         self.skipped_count = 0
         self.failed_count = 0
+        # v1.6.0 心跳
+        self._hb_thread = None
+        self._hb_stop = threading.Event()
+        self.key_lock_lost = False   # 被其他客户端接管
+        self.key_owner_info = ""     # 当前 key 持有者（便于 UI 显示）
 
-    def configure(self, server_url: str, username: str, password: str,
+    def configure(self, server_url: str, api_key: str, client_id: str,
                   auto_upload: bool = True):
         """更新配置（UI 层调）。如果 server_url 变化，重建 client。"""
         new_url = (server_url or "").strip()
         if new_url != self.server_url:
             self.client = None  # 下次 _ensure_client 重建
         self.server_url = new_url
-        self.username = username
-        self.password = password
+        self.api_key = api_key or ""
+        self.client_id = client_id or ""
         self.auto_upload = bool(auto_upload)
 
     def set_enabled(self, enabled: bool):
         self.enabled = bool(enabled)
         if not enabled:
             self.last_error = ""
+            self._stop_heartbeat()
             # 不清空 queue：下次启用时仍可尝试上传
+        else:
+            self.start()
+            self._start_heartbeat()
 
     def start(self):
         if self.thread is None or not self.thread.is_alive():
@@ -590,8 +677,59 @@ class RemoteUploader:
 
     def stop(self, join_timeout: float = 2.0):
         self.stop_event.set()
+        self._stop_heartbeat()
         if self.thread:
             self.thread.join(timeout=join_timeout)
+
+    # ---------- v1.6.0 心跳 ----------
+    def _start_heartbeat(self):
+        if self._hb_thread is not None and self._hb_thread.is_alive():
+            return
+        self._hb_stop.clear()
+        self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._hb_thread.start()
+
+    def _stop_heartbeat(self):
+        self._hb_stop.set()
+        if self._hb_thread:
+            try:
+                self._hb_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            self._hb_thread = None
+
+    def _heartbeat_loop(self):
+        """每 40s 发一次心跳；失败等 5s 重试；410 停止重试并标记 lock_lost。"""
+        while not self._hb_stop.is_set():
+            if not self.enabled:
+                self._hb_stop.wait(timeout=5.0)
+                continue
+            client = self.client
+            if client is None or not self.api_key:
+                # 还没登录，等登录先
+                self._hb_stop.wait(timeout=5.0)
+                continue
+            try:
+                client.heartbeat()
+                if self.key_lock_lost:
+                    # 之前丢失过锁，现在又成功了（重新登录后）
+                    self.key_lock_lost = False
+                    self.last_error = ""
+                self._hb_stop.wait(timeout=client.heartbeat_interval)
+            except Exception as e:
+                code = getattr(e, "code", "")
+                if code == "key_lock_lost":
+                    self.key_lock_lost = True
+                    self.last_error = "该 key 已被其他设备接管（本机已断开）"
+                    try:
+                        self.app.logger.warning(
+                            "[remote] key 被其他客户端接管，停止心跳")
+                    except Exception:
+                        pass
+                    self._hb_stop.wait(timeout=10.0)
+                else:
+                    self.last_error = f"心跳失败: {e}"
+                    self._hb_stop.wait(timeout=5.0)
 
     def enqueue(self, dest_file: str, size: int, mtime: float,
                 rel_path: str):
@@ -620,11 +758,13 @@ class RemoteUploader:
         return self.client
 
     def _login(self):
-        """登录；失败抛。"""
+        """用 API key 登录；失败抛。"""
         client = self._ensure_client()
-        if not self.username or not self.password:
-            raise RuntimeError("未配置用户名/密码")
-        client.login(self.username, self.password)
+        if not self.api_key:
+            raise RuntimeError("未配置 API key")
+        if not self.client_id:
+            raise RuntimeError("未配置客户端标识")
+        client.login_with_key(self.api_key, self.client_id)
 
     def _upload_one(self, task: dict):
         """单文件上传：先 check，再 upload。"""
@@ -941,7 +1081,6 @@ class UCopyApp:
         self.current_jobs = {}
         # 远程模式（v1.5.0+）：后台线程从队列拿任务上传
         self.remote_uploader = RemoteUploader(self)
-        self._remote_password = ""  # UI 层注入（不写 config.json）
         self._init_remote_from_config()
 
         self.root = tk.Tk()
@@ -951,12 +1090,14 @@ class UCopyApp:
         set_auto_start(self.config.get("auto_start", False))
 
     def _init_remote_from_config(self):
-        """把 config.remote 同步到 RemoteUploader（密码从 self._remote_password）。"""
+        """把 config.remote 同步到 RemoteUploader（v1.6.0：从加密存储读 key）。"""
         rem = self.config.get("remote", {}) or {}
+        api_key = load_remote_key(self.config) or ""
+        client_id = rem.get("client_name") or _default_client_id()
         self.remote_uploader.configure(
             server_url=rem.get("server_url", ""),
-            username=rem.get("username", ""),
-            password=self._remote_password,
+            api_key=api_key,
+            client_id=client_id,
             auto_upload=rem.get("auto_upload", True),
         )
         self.remote_uploader.set_enabled(bool(rem.get("enabled", False)))
@@ -1858,7 +1999,7 @@ class SettingsWindow:
         self.win.grab_set()
 
     def _build_remote_frame(self, parent):
-        """构造远程模式子面板。"""
+        """构造远程模式子面板（v1.6.0：API key 认证）。"""
         cfg_remote = (self.app.config.get("remote") or {})
         # 服务器地址
         ttk.Label(parent, text="服务器地址 (https://host:8443):").grid(
@@ -1867,53 +2008,73 @@ class SettingsWindow:
         ttk.Entry(parent, textvariable=self.remote_url_var, width=42).grid(
             row=0, column=1, columnspan=2, padx=5, pady=2, sticky="w")
 
-        # 用户名
-        ttk.Label(parent, text="用户名:").grid(row=1, column=0, sticky="w",
-                                              padx=5, pady=2)
-        self.remote_user_var = tk.StringVar(value=cfg_remote.get("username", ""))
-        ttk.Entry(parent, textvariable=self.remote_user_var, width=20).grid(
-            row=1, column=1, padx=5, pady=2, sticky="w")
+        # API Key（v1.6.0：替代用户名/密码）
+        ttk.Label(parent, text="API Key:").grid(row=1, column=0, sticky="w",
+                                               padx=5, pady=2)
+        self.remote_key_var = tk.StringVar()
+        self.remote_key_entry = ttk.Entry(parent, textvariable=self.remote_key_var,
+                                         show="*", width=42)
+        self.remote_key_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=2,
+                                   sticky="w")
+        saved_key_state = "已保存" if cfg_remote.get("api_key_enc") else "未设置"
+        ttk.Label(parent, text=f"（{saved_key_state}；留空则用已保存的 key）",
+                  foreground="#666", font=("Helvetica", 9)).grid(
+            row=2, column=1, columnspan=2, sticky="w", padx=5)
 
-        # 密码（每次手动输入，不存盘）
-        ttk.Label(parent, text="服务器密码 (不存盘):").grid(
-            row=2, column=0, sticky="w", padx=5, pady=2)
-        self.remote_pw_var = tk.StringVar()
-        self.remote_pw_entry = ttk.Entry(parent, textvariable=self.remote_pw_var,
-                                        show="*", width=20)
-        self.remote_pw_entry.grid(row=2, column=1, padx=5, pady=2, sticky="w")
+        # 客户端名称（显示在服务器 Web GUI 的"使用中"状态里）
+        ttk.Label(parent, text="本机名称:").grid(row=3, column=0, sticky="w",
+                                               padx=5, pady=2)
+        import socket as _sock
+        default_client_name = cfg_remote.get("client_name") or _sock.gethostname() or "UCopy"
+        self.remote_client_name_var = tk.StringVar(value=default_client_name)
+        ttk.Entry(parent, textvariable=self.remote_client_name_var, width=30).grid(
+            row=3, column=1, padx=5, pady=2, sticky="w")
+        ttk.Label(parent, text="（仅用于在服务器上区分设备）",
+                  foreground="#666", font=("Helvetica", 9)).grid(
+            row=3, column=2, sticky="w")
 
         # 启用 + 自动上传
         self.remote_enabled_var = tk.BooleanVar(value=bool(cfg_remote.get("enabled", False)))
         self.remote_auto_var = tk.BooleanVar(value=bool(cfg_remote.get("auto_upload", True)))
         ttk.Checkbutton(parent, text="启用远程模式",
                         variable=self.remote_enabled_var).grid(
-            row=3, column=0, sticky="w", padx=5, pady=2)
+            row=4, column=0, sticky="w", padx=5, pady=2)
         ttk.Checkbutton(parent, text="自动上传已拷贝文件",
                         variable=self.remote_auto_var).grid(
-            row=3, column=1, sticky="w", padx=5, pady=2)
+            row=4, column=1, sticky="w", padx=5, pady=2)
 
         # 指纹 + 状态
         self.remote_fp_var = tk.StringVar(value=cfg_remote.get("trusted_fingerprint", ""))
         ttk.Label(parent, text="服务器证书指纹:").grid(
-            row=4, column=0, sticky="w", padx=5, pady=2)
+            row=5, column=0, sticky="w", padx=5, pady=2)
         ttk.Label(parent, textvariable=self.remote_fp_var, foreground="#555",
                   font=("Courier", 9)).grid(
-            row=4, column=1, columnspan=2, sticky="w", padx=5, pady=2)
+            row=5, column=1, columnspan=2, sticky="w", padx=5, pady=2)
 
         self.remote_status_var = tk.StringVar(value=self._status_text())
         ttk.Label(parent, textvariable=self.remote_status_var, foreground="#333",
                   wraplength=380, justify="left").grid(
-            row=5, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+            row=6, column=0, columnspan=3, sticky="w", padx=5, pady=2)
 
         # 操作按钮
         btn_row = ttk.Frame(parent)
-        btn_row.grid(row=6, column=0, columnspan=3, pady=(6, 0))
+        btn_row.grid(row=7, column=0, columnspan=3, pady=(6, 0))
         ttk.Button(btn_row, text="测试连接", command=self.test_remote).pack(
             side="left", padx=4)
         ttk.Button(btn_row, text="从服务器拉取配置",
                    command=self.pull_remote_config).pack(side="left", padx=4)
         ttk.Button(btn_row, text="推送配置到服务器",
                    command=self.push_remote_config).pack(side="left", padx=4)
+
+    def _get_remote_key(self):
+        """取 API key：输入框优先，否则从加密存储读。"""
+        typed = self.remote_key_var.get().strip()
+        if typed:
+            return typed, True  # (key, needs_save)
+        stored = load_remote_key(self.app.config)
+        if stored:
+            return stored, False
+        return "", False
 
     def _status_text(self):
         u = self.app.remote_uploader
@@ -1937,18 +2098,19 @@ class SettingsWindow:
             self.app.config["remote"].update({
                 "enabled": False,
                 "server_url": self.remote_url_var.get().strip(),
-                "username": self.remote_user_var.get().strip(),
+                "client_name": self.remote_client_name_var.get().strip(),
                 "auto_upload": bool(self.remote_auto_var.get()),
             })
             try:
                 save_config(self.app.config)
             except Exception:
                 pass
+            rem = self.app.config["remote"]
             self.app.remote_uploader.configure(
-                server_url=self.app.config["remote"]["server_url"],
-                username=self.app.config["remote"]["username"],
-                password=self.app._remote_password,
-                auto_upload=self.app.config["remote"]["auto_upload"],
+                server_url=rem["server_url"],
+                api_key=load_remote_key(self.app.config),
+                client_id=rem.get("client_name") or _default_client_id(),
+                auto_upload=rem["auto_upload"],
             )
             self.app.remote_uploader.set_enabled(False)
             try:
@@ -1957,22 +2119,25 @@ class SettingsWindow:
                 pass
             return True
 
-        # 启用路径
+        # 启用路径（v1.6.0：API key）
         url = self.remote_url_var.get().strip()
-        user = self.remote_user_var.get().strip()
-        pw = self.remote_pw_var.get()
+        client_name = self.remote_client_name_var.get().strip()
+        api_key, needs_save = self._get_remote_key()
         if not url:
             messagebox.showerror("错误", "请填写服务器地址", parent=self.win)
             return False
-        if not user:
-            messagebox.showerror("错误", "请填写用户名", parent=self.win)
+        if not client_name:
+            messagebox.showerror("错误", "请填写本机名称", parent=self.win)
             return False
-        if not pw:
-            messagebox.showerror("错误",
-                                 "请填写服务器密码（不存盘，仅本次会话使用）",
-                                 parent=self.win)
+        if not api_key:
+            messagebox.showerror(
+                "错误",
+                "请填写 API Key。\n\n"
+                "在服务器 Web GUI 登录后 → 「API Keys」卡片 → 创建，\n"
+                "复制生成的 key 粘贴到这里。",
+                parent=self.win)
             return False
-        # 强制确认
+        # 强制确认（保留三项：合法用途 / 未受骗 / 服务器地址正确）
         if not RemoteConsentWindow(self.win, url).show():
             # 用户取消
             self.remote_enabled_var.set(False)
@@ -1983,25 +2148,34 @@ class SettingsWindow:
         self.app.config["remote"].update({
             "enabled": True,
             "server_url": url,
-            "username": user,
+            "client_name": client_name,
             "auto_upload": bool(self.remote_auto_var.get()),
         })
+        # v1.6.0：API key 加密存（DPAPI/Keychain/机器绑定）
+        if needs_save:
+            saved = save_remote_key(self.app.config, api_key)
+            if not saved:
+                messagebox.showwarning(
+                    "API Key 无法安全保存",
+                    "当前平台不支持安全凭据存储，key 只在本次会话内存中使用。\n"
+                    "重启 UCopy 后需要重新输入 key。",
+                    parent=self.win)
         try:
             save_config(self.app.config)
         except Exception:
             pass
-        self.app._remote_password = pw
         self.app.remote_uploader.configure(
             server_url=url,
-            username=user,
-            password=pw,
+            api_key=api_key,
+            client_id=client_name,
             auto_upload=bool(self.remote_auto_var.get()),
         )
         self.app.remote_uploader.set_enabled(True)
-        # 清掉密码输入框（不留存）
-        self.remote_pw_var.set("")
+        # 清掉 key 输入框（已加密存盘）
+        if needs_save:
+            self.remote_key_var.set("")
         try:
-            self.app.logger.info(f"[remote] 远程模式已启用: {url}")
+            self.app.logger.info(f"[remote] 远程模式已启用: {url} (client={client_name})")
         except Exception:
             pass
         self._refresh_remote_status()
@@ -2009,11 +2183,21 @@ class SettingsWindow:
 
     def test_remote(self):
         url = self.remote_url_var.get().strip()
-        user = self.remote_user_var.get().strip()
-        pw = self.remote_pw_var.get()
-        if not (url and user and pw):
-            messagebox.showerror("错误", "请填写服务器地址 / 用户名 / 密码",
-                                 parent=self.win)
+        client_name = self.remote_client_name_var.get().strip()
+        api_key, needs_save = self._get_remote_key()
+        if not url:
+            messagebox.showerror("错误", "请填写服务器地址", parent=self.win)
+            return
+        if not client_name:
+            messagebox.showerror("错误", "请填写本机名称", parent=self.win)
+            return
+        if not api_key:
+            messagebox.showerror(
+                "错误",
+                "请填写 API Key。\n\n"
+                "在服务器 Web GUI 登录后 → 「API Keys」卡片 → 创建，\n"
+                "复制生成的 key 粘贴到这里。",
+                parent=self.win)
             return
         if not REMOTE_CLIENT_AVAILABLE:
             messagebox.showerror("错误", "remote_client 模块不可用",
@@ -2062,54 +2246,90 @@ class SettingsWindow:
         # 信任已建立，重新 new client 让它走 CERT_NONE 路径
         client = remote_client.RemoteClient(url, store=store)
         try:
-            client.login(user, pw)
+            login_data = client.login_with_key(api_key, client_name)
             me = client.me()
-            messagebox.showinfo("成功",
-                                f"登录成功！\n用户名: {me['username']}\n"
-                                f"角色: {me['role']}\n"
-                                f"配额: {me['quota_mb']} MB",
-                                parent=self.win)
+            prev = login_data.get("previous_client_id")
+            extra = ""
+            if prev:
+                extra = f"\n\n⚠️ 已接管原占用设备「{prev}」的连接\n（原设备会收到锁丢失，需要重新连接）"
+            messagebox.showinfo(
+                "成功",
+                f"连接成功！\n"
+                f"账号: {me['username']}\n"
+                f"角色: {me['role']}\n"
+                f"配额: {me['quota_mb']} MB\n"
+                f"心跳: 每 {client.heartbeat_interval} 秒{extra}",
+                parent=self.win)
             # 同步 UI 上的 fingerprint 显示
             self.remote_fp_var.set(fp)
-            # 写回 server_url / username / auto_upload 到 cfg (v1.5.5.3)
-            # password 故意不存盘（用户硬性偏好：仅本次会话）
+            # 写回配置
             self.app.config.setdefault("remote", {})
             self.app.config["remote"].update({
                 "server_url": url,
-                "username": user,
+                "client_name": client_name,
                 "auto_upload": bool(self.remote_auto_var.get()),
                 "trusted_fingerprint": fp,
             })
+            # v1.6.0：API key 加密存储
+            if needs_save:
+                saved = save_remote_key(self.app.config, api_key)
+                if not saved:
+                    messagebox.showwarning(
+                        "API Key 无法安全保存",
+                        "当前平台不支持安全凭据存储，key 只在本次会话内存中使用。\n"
+                        "重启 UCopy 后需要重新输入 key。",
+                        parent=self.win)
+                else:
+                    self.remote_key_var.set("")  # 已存盘，清输入框
             try:
                 save_config(self.app.config)
             except Exception:
                 pass
-            # 让 uploader 拿到 client
-            self.app._remote_password = pw
+            # 让 uploader 拿到 client + key
             self.app.remote_uploader.configure(
-                server_url=url, username=user, password=pw,
+                server_url=url, api_key=api_key, client_id=client_name,
                 auto_upload=bool(self.remote_auto_var.get()),
             )
             self.app.remote_uploader.client = client
+            self.app.remote_uploader.key_lock_lost = False
+            # 启动心跳（保持独占锁）
+            self.app.remote_uploader._start_heartbeat()
         except remote_client.RemoteError as e:
-            messagebox.showerror("连接失败",
-                                 f"{f'[{e.code}] ' if e.code else ''}{e.message}",
-                                 parent=self.win)
+            code = getattr(e, "code", "") or ""
+            if code == "key_lock_lost":
+                messagebox.showerror(
+                    "Key 被占用",
+                    "该 key 已被其他设备占用。\n\n"
+                    "每个 key 同一时间只能被一台客户端使用。\n"
+                    "要去占用其他设备，请在服务器 Web GUI 的「API Keys」里点「踢下线」，\n"
+                    "或等对方 2 分钟无心跳后自动释放。",
+                    parent=self.win)
+            elif code in ("unauthenticated", "invalid_key"):
+                messagebox.showerror(
+                    "连接失败",
+                    "API Key 无效。\n\n"
+                    "请在服务器 Web GUI 的「API Keys」卡片重新创建 key，\n"
+                    "并确认复制的是完整的 key（含中间的「.」）。",
+                    parent=self.win)
+            else:
+                messagebox.showerror("连接失败",
+                                     f"{f'[{code}] ' if code else ''}{e.message}",
+                                     parent=self.win)
         except Exception as e:
             messagebox.showerror("连接失败", str(e), parent=self.win)
 
     def pull_remote_config(self):
         """从服务器拉取配置（覆盖本地 security.* 之外的所有字段）。"""
         url = self.remote_url_var.get().strip()
-        user = self.remote_user_var.get().strip()
-        pw = self.remote_pw_var.get()
-        if not (url and user and pw):
-            messagebox.showerror("错误", "请填写服务器地址 / 用户名 / 密码",
+        client_name = self.remote_client_name_var.get().strip()
+        api_key, _ = self._get_remote_key()
+        if not (url and client_name and api_key):
+            messagebox.showerror("错误", "请填写服务器地址 / 本机名称 / API Key",
                                  parent=self.win)
             return
         try:
             client = remote_client.RemoteClient(url)
-            client.login(user, pw)
+            client.login_with_key(api_key, client_name)
             remote_cfg = client.fetch_config()
             if not remote_cfg:
                 messagebox.showinfo("提示", "服务器上还没有保存任何配置",
@@ -2122,9 +2342,8 @@ class SettingsWindow:
             new_cfg["remote"] = self.app.config.get("remote", {})
             self.app.config = new_cfg
             save_config(self.app.config)
-            self.app._remote_password = pw
             self.app.remote_uploader.configure(
-                server_url=url, username=user, password=pw,
+                server_url=url, api_key=api_key, client_id=client_name,
                 auto_upload=bool(self.remote_auto_var.get()),
             )
             self.app.remote_uploader.client = client
@@ -2144,10 +2363,10 @@ class SettingsWindow:
     def push_remote_config(self):
         """把本地配置推送到服务器。"""
         url = self.remote_url_var.get().strip()
-        user = self.remote_user_var.get().strip()
-        pw = self.remote_pw_var.get()
-        if not (url and user and pw):
-            messagebox.showerror("错误", "请填写服务器地址 / 用户名 / 密码",
+        client_name = self.remote_client_name_var.get().strip()
+        api_key, _ = self._get_remote_key()
+        if not (url and client_name and api_key):
+            messagebox.showerror("错误", "请填写服务器地址 / 本机名称 / API Key",
                                  parent=self.win)
             return
         if not messagebox.askyesno("确认推送",
@@ -2158,11 +2377,10 @@ class SettingsWindow:
             return
         try:
             client = remote_client.RemoteClient(url)
-            client.login(user, pw)
+            client.login_with_key(api_key, client_name)
             info = client.push_config(self.app.config)
-            self.app._remote_password = pw
             self.app.remote_uploader.configure(
-                server_url=url, username=user, password=pw,
+                server_url=url, api_key=api_key, client_id=client_name,
                 auto_upload=bool(self.remote_auto_var.get()),
             )
             self.app.remote_uploader.client = client

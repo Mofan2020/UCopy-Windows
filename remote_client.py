@@ -312,6 +312,11 @@ class RemoteClient:
         self.store = store or TrustedServerStore()
         self._jar = http.cookiejar.CookieJar()
         self._opener = None  # lazy init
+        # v1.6.0: API key 认证状态
+        self._api_key: Optional[str] = None
+        self._client_id: Optional[str] = None
+        self._key_id: Optional[int] = None
+        self._heartbeat_interval: int = 40
 
     # ---------- low-level request ----------
     def _build_opener(self):
@@ -391,6 +396,57 @@ class RemoteClient:
         if not obj.get("ok"):
             raise RemoteError("登录失败", "invalid_credentials", 401)
         return obj
+
+    def login_with_key(self, api_key: str, client_id: str) -> dict:
+        """v1.6.0: 用 API key 登录（替代 username/password）。
+
+        api_key 格式：<token>.<secret>
+        返回 {ok, username, role, quota_mb, key_id, client_id,
+              previous_client_id, heartbeat_interval_seconds,
+              lock_timeout_seconds}
+        如果 previous_client_id 非空 = 抢占式踢掉了旧客户端。
+        """
+        obj, _ = self._request("POST", "/api/v1/auth/key",
+                               body={"key": api_key, "client_id": client_id})
+        if not obj.get("ok"):
+            raise RemoteError(obj.get("error") or "登录失败",
+                              obj.get("code") or "invalid_key", 401)
+        # 记住 key/client_id 供 heartbeat 用
+        self._api_key = api_key
+        self._client_id = client_id
+        self._key_id = obj.get("key_id")
+        self._heartbeat_interval = int(obj.get("heartbeat_interval_seconds") or 40)
+        return obj
+
+    def heartbeat(self) -> dict:
+        """v1.6.0: 心跳保持独占锁。
+
+        返回 {ok, heartbeat_interval_seconds}
+        锁被其他客户端接管 → RemoteError(code='key_lock_lost', http_status=410)
+        """
+        if not getattr(self, "_api_key", None) or not getattr(self, "_client_id", None):
+            raise RemoteError("未用 key 登录，无法发心跳", "not_key_authenticated", 0)
+        obj, _ = self._request("POST", "/api/v1/auth/heartbeat",
+                               body={"key": self._api_key,
+                                     "client_id": self._client_id})
+        if not obj.get("ok"):
+            raise RemoteError(obj.get("error") or "心跳失败",
+                              obj.get("code") or "heartbeat_failed", 0)
+        self._heartbeat_interval = int(obj.get("heartbeat_interval_seconds") or 40)
+        return obj
+
+    @property
+    def key_id(self):
+        return getattr(self, "_key_id", None)
+
+    @property
+    def client_id(self):
+        return getattr(self, "_client_id", None)
+
+    @property
+    def heartbeat_interval(self) -> int:
+        """服务端建议的心跳间隔（秒）。默认 40。"""
+        return int(getattr(self, "_heartbeat_interval", 40) or 40)
 
     def logout(self) -> None:
         try:

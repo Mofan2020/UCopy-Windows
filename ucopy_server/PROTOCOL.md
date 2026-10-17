@@ -236,7 +236,76 @@ DELETE /api/v1/admin/users/<username>     # 删除用户（同时删除其文件
 
 返回结构与服务端管理页配套。所有 admin 接口对非 admin 返回 403。
 
-## 6. 错误约定
+## 6. API Key 认证（v1.6.0+）
+
+服务器账号密码**只用于 Web GUI**；UCopy 客户端使用 API key 认证。
+
+### Key 格式
+
+```
+<token>.<secret>
+```
+
+- `token`：32 字节 `secrets.token_urlsafe(32)`（43 字符）
+- `secret`：同上
+- 完整 key 约 87 字符，中间一个 `.`
+- **只在创建时返回一次**；服务端只存 `sha256(token)` 和 `pbkdf2(secret)`，无法再次展示
+
+### Key 管理（需 Web GUI session 登录）
+
+```
+GET    /api/v1/keys                       # 列出当前用户的 key（不含 token/secret）
+POST   /api/v1/keys                       # 创建 {name} → {id, name, key}
+DELETE /api/v1/keys/<id>                  # 删除 key
+DELETE /api/v1/keys/<id>/release          # 强制释放独占锁（踢掉当前客户端）
+```
+
+`GET /api/v1/keys` 返回每个 key 的 `in_use` / `current_client_id` / `heartbeat_age_seconds`。
+
+### Key 认证（UCopy 客户端用）
+
+```
+POST /api/v1/auth/key        # {key, client_id} → 登录
+POST /api/v1/auth/heartbeat  # {key, client_id} → 续锁
+```
+
+**`POST /api/v1/auth/key`** 成功返回：
+
+```json
+{
+  "ok": true,
+  "username": "admin",
+  "role": "admin",
+  "quota_mb": 0,
+  "key_id": 1,
+  "client_id": "my-laptop",
+  "previous_client_id": null,
+  "heartbeat_interval_seconds": 40,
+  "lock_timeout_seconds": 120
+}
+```
+
+- 同时下发 session cookie（后续 `/api/v1/me`、`/api/v1/files/*`、`/api/v1/config` 等业务 API 直接复用）
+- **`previous_client_id` 非 null** = 抢占了原占用设备（原设备会收到 410）
+
+**`POST /api/v1/auth/heartbeat`**：
+
+- 返回 `{ok: true, heartbeat_interval_seconds: 40}`
+- 锁已被其他客户端接管 → `410 key_lock_lost`
+- key 无效 → `401 unauthenticated`
+
+### 独占锁语义
+
+- 一个 key 同一时间只服务一个 `client_id`
+- 登录即抢占：新 `client_id` 登录自动接管（旧客户端下次心跳得 410）
+- 心跳沉默超过 `lock_timeout_seconds`（默认 120s）→ 锁自动释放
+- Web GUI 可主动 `DELETE /api/v1/keys/<id>/release` 踢下线
+
+### 新增错误 code
+
+- `key_lock_lost` (410)：key 已被其他客户端接管，需要重新连接
+
+## 7. 错误约定
 
 所有 4xx/5xx 都返回：
 

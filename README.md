@@ -177,9 +177,11 @@ Output: `dist\UCopy.exe`. `assets/blank.ico` is a **fully transparent** (all-zer
 
 `.github/workflows/build.yml` builds on every push using an AMD64 Windows runner; artifacts are downloadable from the Actions page.
 
-## Remote Mode (v1.5.0+)
+## Remote Mode (v1.6.0)
 
 UCopy can connect to a remote server, automatically upload the files it copies locally, and sync configuration across machines.
+
+**v1.6.0 uses API keys.** The server account password is only used inside the web GUI (to create and manage keys); the UCopy client only ever holds a key. That keeps the account password off every client machine, and lets you revoke or rotate keys without touching the account.
 
 ### Enable
 
@@ -189,19 +191,34 @@ UCopy can connect to a remote server, automatically upload the files it copies l
    python3 ucopy_server/server.py
    ```
 
-   First launch generates a self-signed certificate + initial admin account (random password printed to the terminal). Features: HTTPS (self-signed), dual-stack listening (IPv4 + IPv6), multi-user, quotas, launchd auto-start (macOS), web GUI (`static/index.html` on the server).
+   First launch generates a self-signed certificate + initial admin account (random password printed to the terminal). Features: HTTPS (self-signed), dual-stack listening (IPv4 + IPv6), multi-user, quotas, launchd auto-start (macOS), web GUI.
 
-2. **Open the "Remote Mode" section** in UCopy's settings panel:
+2. **Create an API key in the web GUI** (`https://<server>:8443/`):
+   - Sign in with a server account (admin or regular user)
+   - Open the "API Keys" card → enter a name (e.g. "my laptop") → click "Create"
+   - **Copy the key immediately** (format `<token>.<secret>`, note the dot). It is shown **once** — the server only stores hashes
+   - One key drives one client at a time; create another key for another machine
+
+3. **Open the "Remote Mode" section** in UCopy's settings panel:
    - Server address (e.g. `https://[2609::1]:8443` or `https://example.com:8443`)
-   - Username + server password (the password is **never written to disk**, session-only)
-   - Tick "Enable Remote Mode" → three mandatory confirmation dialogs appear (all three checkboxes must be ticked to enable):
+   - **API Key** (paste the full key from step 2)
+   - **Client name** (defaults to the hostname; the server shows it as `in use: <name>`)
+   - Tick "Enable Remote Mode" → three mandatory confirmations appear (all must be ticked):
      1. I will only use this tool for lawful purposes; all liability for misuse rests with me.
      2. I am not being deceived or induced into enabling this mode.
      3. I have confirmed the server address is correct and that the server has enough storage for my uploads.
 
-3. **First connection** shows a "Trust self-signed certificate" dialog (with the cert fingerprint). After confirmation, the fingerprint is saved to `~/.ucopy_trusted_servers.json` and not prompted again.
+4. **First connection** shows a "Trust self-signed certificate" dialog (with the cert fingerprint). After confirmation, the fingerprint is saved to `~/.ucopy_trusted_servers.json` and not prompted again.
 
-4. **After every USB copy**, a background thread uploads the files that pass the `extensions / regex_pattern / max_single_file_mb` filter to the server. SHA-256 dedup avoids retransfers.
+5. **After every USB copy**, a background thread uploads the files that pass the `extensions / regex_pattern / max_single_file_mb` filter to the server. SHA-256 dedup avoids retransfers.
+
+### Key Lock and Heartbeat
+
+- Each key is **exclusive**: one client at a time
+- The client sends a heartbeat every **40 seconds**; the lock is released after **2 minutes** of silence
+- Moving to a new machine (or reinstalling UCopy) and signing in with the same key **takes over** the connection; the previous client is told it lost the lock
+- To kick a client from the server: web GUI → "API Keys" → "Kick"
+- Deleting a key disconnects its client immediately
 
 ### Server Configuration
 
@@ -211,13 +228,21 @@ UCopy can connect to a remote server, automatically upload the files it copies l
 | Data directory | `~/UCopyServer/` | User files + SQLite + self-signed cert |
 | Initial admin | `admin` | Random password printed to terminal on first launch |
 | Quota | 10 GB/user (admin unlimited) | Excess returns HTTP 413 |
+| Key lock timeout | 120 s | Lock released after this much heartbeat silence |
+| Key heartbeat interval | 40 s | Server-suggested client heartbeat cadence |
 | launchd auto-start | macOS: enabled on first launch | `~/Library/LaunchAgents/com.skyc8266.ucopy-server.plist` |
 
 ### Security
 
+- **The account password never reaches a client.** Clients authenticate with an API key (`<token>.<secret>`).
+- **Server-side key storage:** the token is stored as a SHA-256 hash; the secret is hashed with PBKDF2-SHA256 (200k iterations, per-key salt). A database leak does not reveal usable keys.
+- **Client-side key storage** (`ucopy_credentials.py`):
+  - Windows: **DPAPI** — bound to the current Windows user account; other users and machines cannot decrypt it
+  - macOS: **Keychain**
+  - Linux: machine-bound key derived from `/etc/machine-id`
+  - If none is available the key is **not persisted at all** (no plaintext fallback); it lives in memory for that session only
 - Client → server: HTTPS with self-signed certificate; after the first trust, the cert fingerprint is pinned (defends against MITM).
 - Config sync: password and security-question SHA-256 hashes are **never transmitted** (stripped both on the client and the server side).
-- Server password: lives only in the in-memory session, lost when UCopy exits; re-enter on next enable.
 
 ### Protocol Contract
 

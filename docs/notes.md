@@ -416,6 +416,46 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
   - 之前 v1.5.1 的端到端测试只测 API（`/api/v1/ping`），没测 Web GUI `/`，所以漏检
   - 教训：onefile 打包后必须测**全路径**（HTML / 静态资源 / API），不能只看 API 通就认为 OK
 - **v1.5.0 旧二进制下载的用户**：先 `./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer --print-admin-password` 拿回旧 admin 密码，下载新二进制覆盖后再起；或 `--init-only` 重生数据。
+- **v1.6.0 API Key 认证（替代服务器账密）**：
+  - **动机**：服务器账号密码不应该出现在每台客户端上；key 可吊销/轮换、可审计、可独占绑定设备
+  - **服务端**：
+    - `db.py`：新增 `api_keys` 表（id / username / token_hash / secret_hash / secret_salt / name / current_client_id / last_heartbeat_at / created_at）+ 7 个 CRUD 函数（add / get_by_token / get_by_id / list / delete / claim_lock / update_heartbeat / release_lock / purge_stale / rename）
+    - `auth.py`：`new_key_token()`（32B url-safe）、`hash_key_token()`（sha256）、`hash_key_secret()`（PBKDF2-SHA256 200k + 独立 salt）、`verify_key_secret()`
+    - `server.py` 新路由：`GET/POST /api/v1/keys`、`DELETE /api/v1/keys/{id}`、`DELETE /api/v1/keys/{id}/release`、`POST /api/v1/auth/key`、`POST /api/v1/auth/heartbeat`
+    - **key 格式**：`<token>.<secret>`（87 字符，中间一个点）—— 客户端只存这一串
+    - **key 认证也发 session cookie**：这样 `/api/v1/me`、`/api/v1/files/*`、`/api/v1/config` 等现有业务 API 全部复用 session 认证，无需改造
+    - **独占锁**：`current_client_id` + `last_heartbeat_at`；登录时抢占式接管（新 client 顶掉旧 client）；心跳 client_id 不匹配 → `410 key_lock_lost`
+    - **stale 锁清理**：每个请求顺手 `purge_stale_api_key_locks(120s)`
+    - 常量：`KEY_LOCK_TIMEOUT_SECONDS=120`（2 分钟）、`KEY_HEARTBEAT_INTERVAL_SECONDS=40`
+  - **客户端**：
+    - 新模块 `ucopy_credentials.py`：跨平台凭据加密
+      - Windows：DPAPI (`CryptProtectData`/`CryptUnprotectData`，`CRYPTPROTECT_UI_FORBIDDEN` 不弹窗)
+      - macOS：Keychain（`security add/find/delete-generic-password`，service=`com.skyc8266.ucopy.remote-key`）
+      - Linux：`/etc/machine-id` + 用户名 + 固定 salt 派生 SHA-256 密钥做 XOR
+      - **都不支持时返回 None（拒绝明文落盘）**，调用方弹警告说 key 只在内存里
+    - `remote_client.py`：`login_with_key(api_key, client_id)` / `heartbeat()` / `heartbeat_interval` property / `key_id` / `client_id`
+    - `ucopy.py`：
+      - `load_remote_key(cfg)` / `save_remote_key(cfg, key)` / `clear_remote_key(cfg)`（读写加密 blob）
+      - `_remote_key_account(cfg)`：Keychain/DPAPI 的 account 名 = `server_url|client_name`（多服务器不串）
+      - `RemoteUploader`：`username/password` → `api_key/client_id`；新增心跳线程 `_heartbeat_loop`（40s 一次，失败 5s 重试，`key_lock_lost` 标记）
+      - UI：`用户名`+`密码` 两行 → `API Key`（密码框显示 + 「已保存/未设置」提示）+ `本机名称`（默认 hostname）
+      - `test_remote`：`login_with_key` + 抢占时提示「已接管原占用设备 X」；`key_lock_lost` / `invalid_key` 各有专门错误弹窗
+      - `DEFAULT_CONFIG.remote`：去掉 `username`，加 `client_name` / `api_key_enc`；`get_config()` 引导迁移（`pop("username")` / `pop("password")`）
+  - **Web GUI**：新「API Keys」卡片（所有登录用户可见，不只是 admin）
+    - 列表：名称 / 状态（● 使用中 + client_id / ○ 空闲）/ 创建时间 / 操作
+    - 创建：填名称 → 显示完整 key 一次 + 「复制到剪贴板」按钮
+    - 删除（danger）/ 踢下线（仅占用时显示）
+  - **实测**（本地 build + 真实 server）：
+    - 25 项服务端 API 测试全过（创建/列表/登录/心跳/抢占/踢/删除/越权 alice 看不到 admin 的 key/未登录 401）
+    - 14 组客户端 E2E 全过（cert 信任 → 建 key → key 登录 → 心跳 → 上传文件（验证 session 复用）→ B 抢占 → A 被踢 410 → 强制释放 → 重登 → 凭据加密往返 → 心跳线程 3.5s 发 4 次 → 清理）
+  - **安全性对比**：
+    | 项 | v1.5.x | v1.6.0 |
+    |---|---|---|
+    | 客户端持有 | 用户名 + 密码（密码仅内存） | API key（加密落盘） |
+    | 服务端存 key | — | token=sha256, secret=PBKDF2 200k + 独立 salt |
+    | 密码泄露影响 | 账号被盗 | 单个 key 失效，账号不受影响 |
+    | 吊销粒度 | 无（只能改密码） | 按 key |
+    | 设备绑定 | 无 | 独占锁 + client_id |
 - **v1.5.5.2 UCopy 客户端首次连接 self-signed cert 处理修**：
   - **症状**：「测试连接」点一次后弹「连接失败 [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate」
   - **根因**：`test_remote` 旧版直接 `client.login()` —— `RemoteClient` 看到 store 里没存 fingerprint → 用 `CERT_REQUIRED`（标准 CA 校验）→ self-signed cert 必抛 `SSLCertVerificationError`，但 `test_remote` 的 `except Exception` 把异常包成 `str(e)` 弹窗，**没有「信任此服务器？」入口**

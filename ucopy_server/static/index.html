@@ -282,6 +282,32 @@
       <div class="muted" id="my-pw-msg" style="margin-top:10px"></div>
     </div>
 
+    <div class="card">
+      <h2>API Keys <span class="pill">连接 UCopy 客户端</span></h2>
+      <div class="muted" style="margin-bottom:12px">
+        UCopy 客户端用 key 连接服务器，不需要密码。每个 key 同一时间只能被一台客户端使用（独占），
+        2 分钟无心跳自动释放。key 只在创建时显示一次，请立即复制保存。
+      </div>
+      <div id="keys-list"></div>
+      <h3>创建新 key</h3>
+      <div class="row">
+        <label>名称 <input id="new-key-name" type="text" placeholder="例如：我的笔记本" maxlength="64"></label>
+        <button class="primary" id="btn-create-key">创建</button>
+      </div>
+      <div id="new-key-result" style="display:none; margin-top:14px">
+        <div style="padding:14px; border-radius:10px; background:var(--accent-soft); border:1px solid var(--accent)">
+          <div style="font-weight:600; margin-bottom:8px">⚠️ 请立即复制保存，此 key 只显示一次</div>
+          <textarea id="new-key-value" readonly style="width:100%; min-height:70px; font-family:ui-monospace,Menlo,monospace; font-size:12px"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button class="primary" id="btn-copy-key">复制到剪贴板</button>
+            <button id="btn-close-key">我已保存</button>
+            <span class="muted" id="copy-msg" style="margin-left:auto"></span>
+          </div>
+        </div>
+      </div>
+      <div class="muted" id="keys-msg" style="margin-top:10px"></div>
+    </div>
+
     <div class="card" id="admin-box" style="display:none">
       <h2>用户管理 <span class="pill">admin</span></h2>
       <div id="users"></div>
@@ -425,6 +451,7 @@
       loadLaunchd();
       loadFiles();
       loadConfig();
+      loadKeys();
     } else {
       $('login-box').style.display = '';
       $('main').style.display = 'none';
@@ -531,6 +558,109 @@
       $('users-msg').innerHTML = '<span class="ok">已修改 ' + escapeHtml(username) + ' 的密码</span>';
     } else {
       $('users-msg').innerHTML = '<span class="err">' + escapeHtml(data.error || '修改失败') + '</span>';
+    }
+  }
+
+  // ---- API keys (v1.6.0) ----
+  async function loadKeys() {
+    var data = await api('GET', '/api/v1/keys');
+    if (!data.ok) {
+      $('keys-list').innerHTML = '<div class="err">' + escapeHtml(data.error || '加载失败') + '</div>';
+      return;
+    }
+    if (!data.keys || data.keys.length === 0) {
+      $('keys-list').innerHTML = '<div class="empty"><div class="icon">🔑</div>还没有 key。创建一个来连接 UCopy 客户端。</div>';
+      return;
+    }
+    var html = '<table><thead><tr><th>名称</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>';
+    for (var i = 0; i < data.keys.length; i++) {
+      var k = data.keys[i];
+      var statusHtml = k.in_use
+        ? '<span class="ok">● 使用中</span> <span class="faint">' + escapeHtml(k.current_client_id || '') + '</span>'
+        : '<span class="muted">○ 空闲</span>';
+      var created = k.created_at ? new Date(k.created_at * 1000).toLocaleString() : '-';
+      html += '<tr>' +
+        '<td><b>' + escapeHtml(k.name) + '</b></td>' +
+        '<td>' + statusHtml + '</td>' +
+        '<td class="muted">' + escapeHtml(created) + '</td>' +
+        '<td>' +
+          (k.in_use ? '<button data-release-key="' + k.id + '">踢下线</button> ' : '') +
+          '<button class="danger" data-delete-key="' + k.id + '" data-key-name="' + escapeHtml(k.name) + '">删除</button>' +
+        '</td>' +
+      '</tr>';
+    }
+    html += '</tbody></table>';
+    $('keys-list').innerHTML = html;
+    Array.from($('keys-list').querySelectorAll('button[data-release-key]')).forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        doReleaseKey(parseInt(btn.getAttribute('data-release-key'), 10));
+      });
+    });
+    Array.from($('keys-list').querySelectorAll('button[data-delete-key]')).forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        doDeleteKey(parseInt(btn.getAttribute('data-delete-key'), 10),
+                    btn.getAttribute('data-key-name'));
+      });
+    });
+  }
+
+  async function doCreateKey() {
+    var name = $('new-key-name').value.trim();
+    if (!name) { $('keys-msg').innerHTML = '<span class="err">请填写 key 名称</span>'; return; }
+    $('btn-create-key').disabled = true;
+    var data = await api('POST', '/api/v1/keys', { name: name });
+    $('btn-create-key').disabled = false;
+    if (data.ok) {
+      $('new-key-value').value = data.key;
+      $('new-key-result').style.display = '';
+      $('copy-msg').textContent = '';
+      $('new-key-name').value = '';
+      $('keys-msg').innerHTML = '<span class="ok">已创建 key 「' + escapeHtml(data.name) + '」，请立即复制保存</span>';
+      loadKeys();
+    } else {
+      $('keys-msg').innerHTML = '<span class="err">' + escapeHtml(data.error || '创建失败') + '</span>';
+    }
+  }
+
+  async function doDeleteKey(keyId, keyName) {
+    if (!confirm('确认删除 key 「' + keyName + '」？\n删除后使用该 key 的客户端将无法连接。')) return;
+    var data = await api('DELETE', '/api/v1/keys/' + keyId);
+    if (data.ok) {
+      $('keys-msg').innerHTML = '<span class="ok">已删除</span>';
+      loadKeys();
+    } else {
+      $('keys-msg').innerHTML = '<span class="err">' + escapeHtml(data.error || '删除失败') + '</span>';
+    }
+  }
+
+  async function doReleaseKey(keyId) {
+    if (!confirm('确认踢掉当前使用该 key 的客户端？\n（客户端需要重新连接）')) return;
+    var data = await api('DELETE', '/api/v1/keys/' + keyId + '/release');
+    if (data.ok) {
+      $('keys-msg').innerHTML = data.released
+        ? '<span class="ok">已踢下线（原客户端：' + escapeHtml(data.previous_client_id || '') + '）</span>'
+        : '<span class="muted">该 key 未被占用</span>';
+      loadKeys();
+    } else {
+      $('keys-msg').innerHTML = '<span class="err">' + escapeHtml(data.error || '操作失败') + '</span>';
+    }
+  }
+
+  async function doCopyKey() {
+    var ta = $('new-key-value');
+    if (!ta.value) return;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(ta.value);
+        $('copy-msg').innerHTML = '<span class="ok">已复制</span>';
+      } else {
+        ta.select();
+        document.execCommand('copy');
+        $('copy-msg').innerHTML = '<span class="ok">已复制</span>';
+      }
+    } catch (e) {
+      ta.select();
+      $('copy-msg').innerHTML = '<span class="err">自动复制失败，请手动选择复制</span>';
     }
   }
 
@@ -675,12 +805,16 @@
   bind('btn-logout', doLogout);
   bind('btn-change-my-pw', doChangeMyPassword);
   bind('btn-create-user', doCreateUser);
+  bind('btn-create-key', doCreateKey);
+  bind('btn-copy-key', doCopyKey);
+  bind('btn-close-key', function() { $('new-key-result').style.display = 'none'; });
   bind('btn-install', doInstallLaunchd);
   bind('btn-uninstall', doUninstallLaunchd);
   bind('btn-load-cfg', loadConfig);
   bind('btn-save-cfg', saveConfig);
   bindEnter('login-password', doLogin);
   bindEnter('my-pw-new2', doChangeMyPassword);
+  bindEnter('new-key-name', doCreateKey);
 
   $('server-info').textContent = '· ' + location.host;
 

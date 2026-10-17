@@ -115,15 +115,21 @@ DATA_DIR = None
 DB_CONN = None
 SESSIONS_TTL = 86400
 COOKIE_NAME = "ucopy_session"
+# v1.6.0: API key 心跳锁
+KEY_LOCK_TIMEOUT_SECONDS = 120  # 2 分钟没心跳就释放锁
+KEY_HEARTBEAT_INTERVAL_SECONDS = 40  # 客户端发心跳间隔（参考）
+KEY_MIN_SECRET_LENGTH = 16  # secret 最小长度
 
 
 def init_app(cfg: dict):
     """由 main() 调用：初始化数据目录 / DB / 证书 / admin 账号。"""
     global CFG, DATA_DIR, DB_CONN, SESSIONS_TTL, COOKIE_NAME
+    global KEY_LOCK_TIMEOUT_SECONDS
     CFG = cfg
     DATA_DIR = cfg["data_dir"]
     SESSIONS_TTL = int(cfg.get("session_ttl_seconds", 86400))
     COOKIE_NAME = cfg.get("cookie_name", "ucopy_session")
+    KEY_LOCK_TIMEOUT_SECONDS = int(cfg.get("key_lock_timeout_seconds", 120))
 
     os.makedirs(DATA_DIR, exist_ok=True)
     db_path = os.path.join(DATA_DIR, "server.db")
@@ -292,6 +298,27 @@ class UCRequestHandler(BaseHTTPRequestHandler):
                 return self._api_launchd_install()
             if path == "/api/v1/launchd/uninstall" and method == "POST":
                 return self._api_launchd_uninstall()
+
+            # v1.6.0: API key 管理（需 user session 登录）
+            if path == "/api/v1/keys" and method == "GET":
+                return self._api_keys_list()
+            if path == "/api/v1/keys" and method == "POST":
+                return self._api_keys_create()
+            # 具体的 key 操作：/api/v1/keys/{id} 和 /api/v1/keys/{id}/release
+            if path.startswith("/api/v1/keys/") and method == "DELETE":
+                rest = path[len("/api/v1/keys/"):]
+                # 区分 /api/v1/keys/{id} /api/v1/keys/{id}/release
+                if "/" in rest and rest.endswith("/release"):
+                    key_id = int(rest[:-len("/release")])
+                    return self._api_keys_release(key_id)
+                key_id = int(rest)
+                return self._api_keys_delete(key_id)
+
+            # v1.6.0: 用 API key 登录 + 心跳（不需要 user session）
+            if path == "/api/v1/auth/key" and method == "POST":
+                return self._api_auth_with_key()
+            if path == "/api/v1/auth/heartbeat" and method == "POST":
+                return self._api_auth_heartbeat()
 
             return self._err(404, "not_found", f"no api: {method} {path}")
         except storage.PathError as e:
@@ -661,6 +688,192 @@ class UCRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body_json)
         return None
+
+    # ----- API keys (v1.6.0) -----
+    def _api_keys_list(self):
+        """列出当前用户的 keys（不含 secret/token）。"""
+        user = self._require_user()
+        if user is None:
+            return self._err(401, "unauthenticated", "未登录")
+        if user is False:
+            return self._err(403, "forbidden", "权限不足")
+        # 顺手清 stale 锁
+        db.purge_stale_api_key_locks(DB_CONN, KEY_LOCK_TIMEOUT_SECONDS)
+        rows = db.list_api_keys(DB_CONN, user["username"])
+        now = time.time()
+        keys = []
+        for r in rows:
+            locked = bool(r.get("current_client_id"))
+            hb = r.get("last_heartbeat_at")
+            keys.append({
+                "id": r["id"],
+                "name": r["name"],
+                "created_at": r["created_at"],
+                "current_client_id": r.get("current_client_id"),
+                "last_heartbeat_at": hb,
+                "heartbeat_age_seconds": (now - hb) if hb else None,
+                "in_use": locked,
+            })
+        return self._json(200, {"ok": True, "keys": keys})
+
+    def _api_keys_create(self):
+        """创建 key：返回 key_token + key_secret（只此一次）。"""
+        user = self._require_user()
+        if user is None:
+            return self._err(401, "unauthenticated", "未登录")
+        if user is False:
+            return self._err(403, "forbidden", "权限不足")
+        body = self._read_json() or {}
+        name = (body.get("name") or "").strip()
+        if not name:
+            return self._err(400, "bad_request", "name 必填")
+        if len(name) > 64:
+            return self._err(400, "bad_request", "name 太长（最多 64 字符）")
+        # 生成 token + secret
+        key_token = auth.new_key_token()
+        key_secret = auth.new_key_token()  # 同一 API 复用（32 字节 url-safe）
+        secret_hash, secret_salt = auth.hash_key_secret(key_secret)
+        key_id = db.add_api_key(
+            DB_CONN,
+            username=user["username"],
+            token_hash=auth.hash_key_token(key_token),
+            secret_hash=secret_hash,
+            secret_salt=secret_salt,
+            name=name,
+        )
+        LOG.info(f"[keys] {user['username']} 创建 key #{key_id} ({name})")
+        return self._json(200, {
+            "ok": True,
+            "id": key_id,
+            "name": name,
+            # 客户端填的完整 key = token + "." + secret
+            "key": f"{key_token}.{key_secret}",
+            "note": "请立即保存。服务器只存 hash，无法再次显示。",
+        })
+
+    def _api_keys_delete(self, key_id: int):
+        """删除 key（只能删自己的）。"""
+        user = self._require_user()
+        if user is None:
+            return self._err(401, "unauthenticated", "未登录")
+        if user is False:
+            return self._err(403, "forbidden", "权限不足")
+        n = db.delete_api_key(DB_CONN, key_id, user["username"])
+        if n == 0:
+            return self._err(404, "not_found", "key 不存在或不属于当前用户")
+        LOG.info(f"[keys] {user['username']} 删除 key #{key_id}")
+        return self._json(200, {"ok": True})
+
+    def _api_keys_release(self, key_id: int):
+        """强制释放 key 的独占锁（踢掉当前占用的客户端）。
+
+        用于场景：客户端崩了没来得及释放锁，但 2 分钟心跳超时也会自动释放。
+        """
+        user = self._require_user()
+        if user is None:
+            return self._err(401, "unauthenticated", "未登录")
+        if user is False:
+            return self._err(403, "forbidden", "权限不足")
+        row = db.get_api_key_by_id(DB_CONN, key_id, user["username"])
+        if not row:
+            return self._err(404, "not_found", "key 不存在或不属于当前用户")
+        if not row["current_client_id"]:
+            return self._json(200, {"ok": True, "released": False,
+                                    "message": "该 key 当前未被占用"})
+        prev_client = row["current_client_id"]
+        db.release_api_key_lock(DB_CONN, key_id, user["username"], prev_client)
+        LOG.info(f"[keys] {user['username']} 强制释放 key #{key_id}（踢断 {prev_client}）")
+        return self._json(200, {"ok": True, "released": True,
+                                "previous_client_id": prev_client})
+
+    def _api_auth_with_key(self):
+        """用 API key 登录（UCopy 客户端）。
+
+        body: {key, client_id}
+        - key 格式：<token>.<secret>
+        - 校验 token hash，再校验 secret（pbkdf2）
+        - 获取独占锁（如果已有 current_client_id 则抢占 = 踢掉旧客户端）
+        - 返回 user / role / quota_mb + key_id
+        """
+        db.purge_stale_api_key_locks(DB_CONN, KEY_LOCK_TIMEOUT_SECONDS)
+        body = self._read_json() or {}
+        full_key = (body.get("key") or "").strip()
+        client_id = (body.get("client_id") or "").strip()
+        if not full_key or "." not in full_key:
+            return self._err(400, "bad_request", "key 格式错误（应为 <token>.<secret>）")
+        if not client_id:
+            return self._err(400, "bad_request", "client_id 必填")
+        if len(client_id) > 128:
+            return self._err(400, "bad_request", "client_id 太长")
+        token, _, secret = full_key.partition(".")
+        token_hash = auth.hash_key_token(token)
+        row = db.get_api_key_by_token(DB_CONN, token_hash)
+        if not row:
+            return self._err(401, "unauthenticated", "无效的 key")
+        if not auth.verify_key_secret(secret, row["secret_hash"]):
+            return self._err(401, "unauthenticated", "无效的 key")
+        # 用户可能已被删除
+        user = db.get_user(DB_CONN, row["username"])
+        if not user:
+            return self._err(401, "unauthenticated", "对应账号已删除")
+        # 独占锁：抢占式（兼容"客户端重装/换机"场景）
+        prev = row["current_client_id"]
+        db.claim_api_key_lock(DB_CONN, row["id"], row["username"], client_id)
+        if prev and prev != client_id:
+            LOG.info(f"[keys] key #{row['id']} 被 {client_id} 接管（原 {prev} 被踢）")
+        # v1.6.0: key 认证也发 session cookie（业务 API 复用 session 认证）
+        session_token = auth.new_session_id()
+        db.add_session(DB_CONN, auth.hash_session_id(session_token),
+                       row["username"], SESSIONS_TTL)
+        LOG.info(f"[keys] {row['username']} 用 key #{row['id']} 登录 (client_id={client_id})")
+        # 需要带 Set-Cookie，所以手写响应（不能用 _json）
+        self.send_response(200)
+        self._set_session_cookie(session_token)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-UCopy-Protocol", "1")
+        self.send_header("Connection", "close")
+        body_json = json.dumps({
+            "ok": True,
+            "username": row["username"],
+            "role": user["role"],
+            "quota_mb": user["quota_mb"],
+            "key_id": row["id"],
+            "client_id": client_id,
+            "previous_client_id": prev if prev != client_id else None,
+            "heartbeat_interval_seconds": KEY_HEARTBEAT_INTERVAL_SECONDS,
+            "lock_timeout_seconds": KEY_LOCK_TIMEOUT_SECONDS,
+        }, ensure_ascii=False).encode("utf-8")
+        self.send_header("Content-Length", str(len(body_json)))
+        self.end_headers()
+        self.wfile.write(body_json)
+        return None
+
+    def _api_auth_heartbeat(self):
+        """客户端心跳：保持独占锁。
+
+        body: {key, client_id}
+        - key 校验同 _api_auth_with_key
+        - 如果 client_id 不匹配（被其他客户端接管）→ 410 gone
+        """
+        db.purge_stale_api_key_locks(DB_CONN, KEY_LOCK_TIMEOUT_SECONDS)
+        body = self._read_json() or {}
+        full_key = (body.get("key") or "").strip()
+        client_id = (body.get("client_id") or "").strip()
+        if not full_key or "." not in full_key:
+            return self._err(400, "bad_request", "key 格式错误")
+        if not client_id:
+            return self._err(400, "bad_request", "client_id 必填")
+        token, _, secret = full_key.partition(".")
+        row = db.get_api_key_by_token(DB_CONN, auth.hash_key_token(token))
+        if not row or not auth.verify_key_secret(secret, row["secret_hash"]):
+            return self._err(401, "unauthenticated", "无效的 key")
+        ok = db.update_api_key_heartbeat(
+            DB_CONN, row["id"], row["username"], client_id)
+        if not ok:
+            return self._err(410, "key_lock_lost",
+                             "该 key 已被其他客户端接管，请重新连接")
+        return self._json(200, {"ok": True,
+                                "heartbeat_interval_seconds": KEY_HEARTBEAT_INTERVAL_SECONDS})
 
     # ----- launchd -----
     def _api_launchd_status(self):
