@@ -103,11 +103,11 @@ jobs:
           if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
               echo "[publish] release 已存在，upload 追加 server"
           else
-              echo "[publish] release 不存在，create"
+              echo "[publish] release 不存在，create + 设 prerelease"
               gh release create "${{ github.ref_name }}" \
                   "UCopy-Server-macos-arm64#UCopy-Server-macos-arm64" \
                   --title "UCopy Server -- ${{ github.ref_name }}" \
-                  --generate-notes
+                  --generate-notes --prerelease
           fi
           gh release upload "${{ github.ref_name }}" UCopy-Server-macos-arm64 --clobber
           echo "[publish] final assets:"
