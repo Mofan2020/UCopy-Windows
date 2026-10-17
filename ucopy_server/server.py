@@ -739,10 +739,37 @@ def make_server(cfg: dict, httpd):
     return httpd
 
 
+def _server_address_family(bind_host: str):
+    """根据 bind_host 决定 ThreadingHTTPServer 用 AF_INET 还是 AF_INET6。
+
+    - '0.0.0.0' / '127.0.0.1' / IPv4 → AF_INET
+    - '[::]' / '::' / 含 ':' → AF_INET6（IPv6 双栈靠 IPV6_V6ONLY=0 实现）
+    """
+    import socket as _socket
+    if ":" in bind_host:
+        return _socket.AF_INET6
+    return _socket.AF_INET
+
+
+def _enable_ipv6_dual_stack(sock):
+    """给 IPv6 socket 开 IPV6_V6ONLY=0，让 :: 通配同时接受 IPv4 mapped。"""
+    import socket as _socket
+    if sock.family == _socket.AF_INET6 and hasattr(_socket, "IPV6_V6ONLY"):
+        try:
+            sock.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 0)
+        except OSError as e:
+            LOG.warning(f"[bind] 启用 IPv4-mapped over IPv6 失败: {e}")
+
+
 class ThreadingHTTPSServer(ThreadingHTTPServer):
     """Python 3.7+ 的 ThreadingHTTPServer 已经线程化了，继承即可用。"""
     daemon_threads = True
     allow_reuse_address = True
+
+    def server_bind(self):
+        # 在 bind() 之前开 IPV6_V6ONLY=0，让 :: 通配同时接受 v4 mapped
+        _enable_ipv6_dual_stack(self.socket)
+        super().server_bind()
 
 
 def run():
@@ -777,14 +804,18 @@ def run():
         ok = launchd.install(f"{sys.executable} {os.path.abspath(__file__)}")
         LOG.info(f"[launchd] 注册{'成功' if ok else '失败'}")
 
+    # 根据 bind_host 选 AF（'0.0.0.0'→AF_INET，'[::]'→AF_INET6 双栈）
+    ThreadingHTTPServer.address_family = _server_address_family(cfg["bind_host"])
     bind = (cfg["bind_host"], int(cfg["port"]))
     try:
         httpd = ThreadingHTTPServer(bind, UCRequestHandler)
     except OSError as e:
         LOG.error(f"绑定 {cfg['bind_host']}:{cfg['port']} 失败: {e}")
-        LOG.error("提示：bind-host 可设 '0.0.0.0' / '127.0.0.1' / 具体 IP，"
-                  "或用 '[::]'（注意 IPv6 通配符在 macOS 上要进 /etc/hosts "
-                  "里加 ::1 localhost）")
+        LOG.error("提示：--bind-host 可设为：")
+        LOG.error("  0.0.0.0            # IPv4 通配（默认）")
+        LOG.error("  127.0.0.1          # 仅本机")
+        LOG.error("  本机具体 IP        # 仅该 IP（防火墙/转发需要）")
+        LOG.error("  [::] 或具体 IPv6   # IPv6；先确认地址在本机网卡上")
         sys.exit(1)
     httpd = make_server(cfg, httpd)
 

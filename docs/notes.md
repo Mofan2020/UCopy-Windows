@@ -359,3 +359,4 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
 - **客户端 sha256 缓存**：每次上传前都重算 sha256（~100MB/s，无 IO 瓶颈但 CPU 浪费）。可后续加 file_hash_cache。
 - **服务端媒体预览**：Web GUI 文件列表不显示缩略图 / 视频预览（raw video / mp4 不在范围内）。
 - **摄像头/麦克风检测改进**：kernel filter driver 漏检（pitfall #17）未处理，超出范围；按用户原话"修不了就算了，一切问题都怪微软！"。
+- **v1.5.0 → v1.5.1 macOS 绑定 fix**：默认 `bind-host` 从 `'::'` 改为 `'0.0.0.0'`。原默认在 macOS 上依赖 `/etc/hosts` 有 `::1 localhost` 才能解析 `getaddrinfo('::', port)`，否则报 `Errno 8 nodename nor servname provided` 直接 exit。普通用户不该被要求改 hosts。**IPv6 仍支持**：`[::]` 或具体 IPv6 地址（如 `2409:8a1e:...`）能正常监听；为此改 `ThreadingHTTPServer.address_family` 按 hostname 含 `:` 自动切 `AF_INET6` + `IPV6_V6ONLY=0` 实现双栈。

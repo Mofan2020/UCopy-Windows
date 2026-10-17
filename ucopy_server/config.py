@@ -22,7 +22,9 @@ import sys
 
 DEFAULT_PORT = 8443
 DEFAULT_DATA_DIR = os.path.join(os.path.expanduser("~"), "UCopyServer")
-DEFAULT_BIND_HOST = "::"  # IPv6 wildcard；IPv4 mapped 兼容
+# 默认 IPv4 通配：避免 macOS 上 '::' 通配需要 /etc/hosts 配 ::1 localhost 才能解析的问题。
+# 想用 IPv6 监听：传 --bind-host '[::]'（注意中括号必须），或具体地址如 2409:8a1e:...。
+DEFAULT_BIND_HOST = "0.0.0.0"
 
 DEFAULT_CONFIG = {
     "port": DEFAULT_PORT,
@@ -46,7 +48,8 @@ def parse_args(argv=None):
     )
     parser.add_argument("--port", type=int, help=f"监听端口（默认 {DEFAULT_PORT}）")
     parser.add_argument("--data-dir", help=f"数据目录（默认 {DEFAULT_DATA_DIR}）")
-    parser.add_argument("--bind-host", help=f"绑定地址（默认 {DEFAULT_BIND_HOST} 双栈）")
+    parser.add_argument("--bind-host",
+                        help="绑定地址（默认 0.0.0.0；IPv6 用 '[::]' 或具体 IPv6）")
     parser.add_argument("--no-autostart", action="store_true",
                         help="不注册 macOS launchd 自启动")
     parser.add_argument("--init-only", action="store_true",
