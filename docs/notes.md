@@ -396,9 +396,19 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
   - **新 CLI 参数**（`config.py`）：`--detach` / `--stop` / `--log-file` / `--pid-file`
   - **默认路径**：log = `<data-dir>/server.log`，pid = `<data-dir>/server.pid`
   - **detach 模式不注册 launchd**：避免和 launchd 重复管理
+  - **detach 模式 static 404 根因（v1.5.5 后修）**：
+    - **症状**：detach 模式启动后 `GET /` → 404「Web GUI 未安装（static/index.html 不存在）」
+    - **根因**：PyInstaller onefile 把 `ucopy_server/static/` 解压到临时 `_MEIPASS/ucopy_server/static/`；模块加载时算 STATIC_DIR 指向这个临时目录；detach 模式 double-fork 后 macOS 系统 TMPDIR 自动清理 unlink 整个 _MEIPASS 目录（即使 daemon 进程 fd 还指向文件，路径字符串已失效）→ `os.path.exists` 走 lstat 拿不到 inode → 报 404
+    - **修法**：模块加载时 `_load_static_files()` 一次性把所有 static/* 读到内存 dict（`STATIC_FILES`），`_serve_index` / `_serve_static_or_index` 从 dict 读 → 完全绕开文件系统
+    - **代价**：HTML 27KB + JS/CSS 多一点，~50KB 内存常驻（不可接受就别用 detach 模式）
+  - **zombie 状态（v1.5.5 后修）**：
+    - **症状**：`--stop` 后 `is_pid_alive(daemon_pid)` 仍 True（daemon 进程已死但 init 还没回收 zombie）
+    - **修法**：`stop()` 三阶段：SIGTERM 等 5s → SIGKILL 等 5s → 再 fail；zombie 阶段 5s 内 init 一定回收
+  - **重复 --stop 视为 OK**：无 PID 文件 = `OK: 未在运行（无 PID 文件）` exit=0
   - **实测**（macOS arm64 本地 build）：
-    - `--detach` 父进程 exit=0，子进程 PID 写入 pid_file，端口 18600 LISTEN，curl `/api/v1/ping` 200
-    - `--stop` 检测 PID 44605 已退出 → 自动清 stale pid 文件 → `OK: ...` 退出 0
+    - `--detach` 父进程 exit=0，子进程 PID 写入 pid_file，端口 LISTEN，curl 200
+    - 等 15s（让 macOS 清理 _MEIPASS）→ curl 仍 200（内存缓存生效）
+    - `--stop` SIGKILL 阶段 + 自动清 stale pid
   - **文档**：中英 README 各加「macOS 服务器」独立段（默认数据路径表 + 完整 CLI 参数表 + 后台模式 vs 前台模式对比）
 - **v1.5.0 → v1.5.1 Web GUI 404 fix**（**严重**，未在 v1.5.1 release 内修）：
   - `server.py` 原来用 `os.path.join(THIS_DIR, "static")` 找 `index.html`，但在 PyInstaller onefile 模式下 `__file__` 指向解压临时目录（只有 `ucopy_server/server.py`），`ucopy_server/static/` 在 `sys._MEIPASS/ucopy_server/static/`

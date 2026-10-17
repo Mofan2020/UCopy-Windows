@@ -63,7 +63,38 @@ def _resolve_static_dir() -> str:
     # 找不到就回退到第一个候选（让 _serve_index 报 404 时消息更准确）
     return candidates[0]
 
+
 STATIC_DIR = _resolve_static_dir()
+
+
+def _load_static_files() -> dict:
+    """把 static/ 下所有文件读到内存 dict（path -> bytes）。
+
+    为什么不在模块加载时只算 STATIC_DIR 就够：
+    PyInstaller onefile 启动时解压到 _MEIPASS/ 子目录。--detach 模式
+    下 double-fork 后 macOS 系统的 TMPDIR 自动清理会 unlink 这个 _MEIPASS
+    目录（即使 daemon 进程还持有 fd），导致 STATIC_DIR 字符串路径上的
+    文件查找全部失败 (os.path.exists 走 lstat 拿不到 inode)。
+    把所有文件读到内存后完全绕开文件系统。
+    """
+    result = {}
+    static_root = STATIC_DIR
+    if not os.path.isdir(static_root):
+        return result
+    for dirpath, _dirs, files in os.walk(static_root):
+        for name in files:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, static_root).replace(os.sep, "/")
+            try:
+                with open(full, "rb") as f:
+                    result[rel] = f.read()
+            except OSError:
+                # 文件读失败跳过（不该发生但兜底）
+                pass
+    return result
+
+
+STATIC_FILES = _load_static_files()
 
 try:
     from ucopy_server import db, auth, storage, launchd, cert
@@ -751,15 +782,13 @@ class UCRequestHandler(BaseHTTPRequestHandler):
         # 安全：拒绝 .. / 绝对
         if ".." in path.split("/") or path.startswith("/"):
             return self._err(404, "not_found", "no such path")
-        static_dir = STATIC_DIR
         if not path:
             return self._serve_index()
-        full = os.path.join(static_dir, path)
-        if os.path.isfile(full):
-            mime, _ = mimetypes.guess_type(full)
+        # v1.5.5: 用内存缓存避免 detach 模式下 _MEIPASS 目录被 macOS 清理
+        data = STATIC_FILES.get(path)
+        if data is not None:
+            mime, _ = mimetypes.guess_type(path)
             mime = mime or "application/octet-stream"
-            with open(full, "rb") as f:
-                data = f.read()
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(data)))
@@ -772,17 +801,16 @@ class UCRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_index(self):
         # 简单的 SPA：所有非 /api/v1/* 请求都返回 index.html
-        index_path = os.path.join(STATIC_DIR, "index.html")
-        if not os.path.exists(index_path):
+        # v1.5.5: 用内存缓存避免 detach 模式下 _MEIPASS 目录被 macOS 清理
+        index_data = STATIC_FILES.get("index.html")
+        if not index_data:
             return self._err(404, "not_found", "Web GUI 未安装（static/index.html 不存在）")
-        with open(index_path, "rb") as f:
-            data = f.read()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(len(index_data)))
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(index_data)
 
 
 # ---------- helpers ----------
