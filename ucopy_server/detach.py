@@ -74,7 +74,9 @@ def is_pid_alive(pid: int) -> bool:
         finally:
             kernel32.CloseHandle(h)
     else:
-        # Unix: kill -0
+        # Unix: kill -0 测存在性。zombie 状态会返回 True（误判），但 stop() 阶段
+        # SIGTERM 5s + SIGKILL 5s 总共 10s 足够 init 回收 zombie，第三次 is_pid_alive
+        # 检查会变 False。
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -89,10 +91,17 @@ def is_pid_alive(pid: int) -> bool:
 
 def stop(pid_file: str, timeout: float = 5.0) -> tuple[bool, str]:
     """读 pid 文件 → kill 进程 → 等退出 → 清 pid 文件。
-    返回 (成功, 消息)。"""
+    返回 (成功, 消息)。
+
+    三阶段：
+      1. SIGTERM 后等 timeout 秒（默认 5s）
+      2. 还没退就 SIGKILL，再等 timeout 秒
+      3. 还没退就 fail（不存在的进程会被 waitpid/init 回收；最坏情况等 2*timeout）
+    """
     pid = read_pid(pid_file)
     if pid is None:
-        return False, f"未找到 PID 文件 {pid_file}（可能没在 detach 模式运行）"
+        # 没有 PID 文件 → 算"已停"，是 OK
+        return True, "未在运行（无 PID 文件）"
     if not is_pid_alive(pid):
         remove_pid(pid_file)
         return True, f"PID {pid} 已不存在，清掉残留 PID 文件"
@@ -109,15 +118,16 @@ def stop(pid_file: str, timeout: float = 5.0) -> tuple[bool, str]:
         except Exception as e:
             return False, f"taskkill 失败: {e}"
     else:
+        # 第一阶段：SIGTERM
         try:
-            os.kill(pid, 15)  # SIGTERM
+            os.kill(pid, 15)
         except ProcessLookupError:
             remove_pid(pid_file)
             return True, f"PID {pid} 刚退出"
         except PermissionError as e:
             return False, f"无权限停止 PID {pid}: {e}"
 
-    # 等进程退出
+    # 第一阶段等 SIGTERM 生效
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not is_pid_alive(pid):
@@ -127,15 +137,30 @@ def stop(pid_file: str, timeout: float = 5.0) -> tuple[bool, str]:
 
     if sys.platform == "win32":
         return False, f"PID {pid} 5 秒后仍未退出（请手动 taskkill）"
-    # Unix: 升级到 SIGKILL
+
+    # 第二阶段：SIGKILL
     try:
         os.kill(pid, 9)
     except ProcessLookupError:
-        pass
+        remove_pid(pid_file)
+        return True, f"PID {pid} SIGKILL 阶段已退出"
+    except PermissionError as e:
+        return False, f"SIGKILL 无权限: {e}"
+
+    # 第二阶段等 SIGKILL 生效
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not is_pid_alive(pid):
+            remove_pid(pid_file)
+            return True, f"PID {pid} SIGKILL 已停止"
+        time.sleep(0.1)
+
     if is_pid_alive(pid):
-        return False, f"PID {pid} SIGKILL 后仍未退出（内核 bug？）"
+        return False, f"PID {pid} SIGKILL 后 {timeout}s 仍未退出（内核 bug？）"
+
+    # 走到这里说明进程已死但 is_pid_alive 在最后一轮循环里没赶上
     remove_pid(pid_file)
-    return True, f"PID {pid} SIGKILL 强制停止"
+    return True, f"PID {pid} 已停止"
 
 
 # ---------- 后台化（macOS / Linux）----------
