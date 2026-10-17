@@ -270,6 +270,18 @@
       </div>
     </div>
 
+    <div class="card">
+      <h2>修改我的密码</h2>
+      <div class="row">
+        <label>当前密码 <input id="my-pw-old" type="password" autocomplete="current-password"></label>
+        <label>新密码 <input id="my-pw-new" type="password" autocomplete="new-password"></label>
+        <label>确认新密码 <input id="my-pw-new2" type="password" autocomplete="new-password"></label>
+        <button class="primary" id="btn-change-my-pw">修改密码</button>
+      </div>
+      <div class="muted" style="margin-top:6px">改完后会自动登出，需要用新密码重新登录。</div>
+      <div class="muted" id="my-pw-msg" style="margin-top:10px"></div>
+    </div>
+
     <div class="card" id="admin-box" style="display:none">
       <h2>用户管理 <span class="pill">admin</span></h2>
       <div id="users"></div>
@@ -440,13 +452,19 @@
         '<td><span class="role-badge ' + escapeHtml(u.role) + '">' + escapeHtml(u.role) + '</span></td>' +
         '<td>' + escapeHtml(quota_str) + '</td>' +
         '<td>' + used_mb + ' MB</td>' +
-        '<td><button class="danger" data-del-user="' + escapeHtml(u.username) + '">删除</button></td>' +
+        '<td>' +
+          '<button data-pw-user="' + escapeHtml(u.username) + '">改密码</button> ' +
+          '<button class="danger" data-del-user="' + escapeHtml(u.username) + '">删除</button>' +
+        '</td>' +
         '</tr>';
     }
     html += '</tbody></table>';
     $('users').innerHTML = html;
     Array.from($('users').querySelectorAll('button[data-del-user]')).forEach(function(btn) {
       btn.addEventListener('click', function() { doDeleteUser(btn.getAttribute('data-del-user')); });
+    });
+    Array.from($('users').querySelectorAll('button[data-pw-user]')).forEach(function(btn) {
+      btn.addEventListener('click', function() { doAdminChangePw(btn.getAttribute('data-pw-user')); });
     });
   }
 
@@ -479,6 +497,40 @@
       loadUsers();
     } else {
       $('users-msg').innerHTML = '<span class="err">' + escapeHtml(data.error || '删除失败') + '</span>';
+    }
+  }
+
+  // ---- 修改自己的密码 ----
+  async function doChangeMyPassword() {
+    var oldPw = $('my-pw-old').value;
+    var newPw = $('my-pw-new').value;
+    var newPw2 = $('my-pw-new2').value;
+    if (!oldPw || !newPw) { $('my-pw-msg').innerHTML = '<span class="err">请填写所有字段</span>'; return; }
+    if (newPw.length < 6) { $('my-pw-msg').innerHTML = '<span class="err">新密码至少 6 个字符</span>'; return; }
+    if (newPw !== newPw2) { $('my-pw-msg').innerHTML = '<span class="err">两次输入的新密码不一致</span>'; return; }
+    $('btn-change-my-pw').disabled = true;
+    var data = await api('PUT', '/api/v1/users/me/password',
+      { old_password: oldPw, new_password: newPw });
+    $('btn-change-my-pw').disabled = false;
+    if (data.ok) {
+      $('my-pw-msg').innerHTML = '<span class="ok">密码已修改，3 秒后跳转到登录页…</span>';
+      setTimeout(function() { location.reload(); }, 3000);
+    } else {
+      $('my-pw-msg').innerHTML = '<span class="err">' + escapeHtml(data.error || '修改失败') + '</span>';
+    }
+  }
+
+  // ---- admin 改他人密码 ----
+  async function doAdminChangePw(username) {
+    var newPw = prompt('为用户 ' + username + ' 设置新密码（至少 6 个字符）：');
+    if (newPw == null) return;
+    if (newPw.length < 6) { alert('新密码至少 6 个字符'); return; }
+    var data = await api('PATCH', '/api/v1/admin/users/' + encodeURIComponent(username),
+      { password: newPw });
+    if (data.ok) {
+      $('users-msg').innerHTML = '<span class="ok">已修改 ' + escapeHtml(username) + ' 的密码</span>';
+    } else {
+      $('users-msg').innerHTML = '<span class="err">' + escapeHtml(data.error || '修改失败') + '</span>';
     }
   }
 
@@ -621,12 +673,14 @@
 
   bind('btn-login', doLogin);
   bind('btn-logout', doLogout);
+  bind('btn-change-my-pw', doChangeMyPassword);
   bind('btn-create-user', doCreateUser);
   bind('btn-install', doInstallLaunchd);
   bind('btn-uninstall', doUninstallLaunchd);
   bind('btn-load-cfg', loadConfig);
   bind('btn-save-cfg', saveConfig);
   bindEnter('login-password', doLogin);
+  bindEnter('my-pw-new2', doChangeMyPassword);
 
   $('server-info').textContent = '· ' + location.host;
 

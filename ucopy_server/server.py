@@ -202,6 +202,13 @@ class UCRequestHandler(BaseHTTPRequestHandler):
         else:
             self._err(404, "not_found", f"no route: {self.command} {path}")
 
+    def do_PATCH(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/api/v1/"):
+            self._dispatch_api("PATCH")
+        else:
+            self._err(404, "not_found", f"no route: {self.command} {path}")
+
     # ----- API 路由 -----
     def _dispatch_api(self, method: str):
         path = urllib.parse.urlsplit(self.path).path
@@ -243,6 +250,10 @@ class UCRequestHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/v1/admin/users/") and method == "DELETE":
                 username = urllib.parse.unquote(path[len("/api/v1/admin/users/"):])
                 return self._api_admin_delete_user(username)
+
+            # 修改自己的密码（任何登录用户）
+            if path == "/api/v1/users/me/password" and method == "PUT":
+                return self._api_change_my_password()
 
             if path == "/api/v1/launchd" and method == "GET":
                 return self._api_launchd_status()
@@ -577,6 +588,48 @@ class UCRequestHandler(BaseHTTPRequestHandler):
         storage.remove_path(uroot)
         db.delete_user(DB_CONN, username)
         return self._json(200, {"ok": True})
+
+    # ----- 修改自己的密码 -----
+    def _api_change_my_password(self):
+        """任何登录用户改自己密码。需提供 old_password 验证。"""
+        user = self._require_user()
+        if user is None:
+            return self._err(401, "unauthenticated", "未登录")
+        if user is False:
+            return self._err(403, "forbidden", "权限不足")
+        body = self._read_json() or {}
+        old = body.get("old_password", "")
+        new = body.get("new_password", "")
+        if not old or not new:
+            return self._err(400, "bad_request", "old_password / new_password 必填")
+        if len(new) < 6:
+            return self._err(400, "bad_request", "新密码至少 6 个字符")
+        # 校验旧密码
+        row = db.get_user(DB_CONN, user["username"])
+        if not row or not auth.verify_password(old, row["password_hash"]):
+            return self._err(403, "forbidden", "旧密码错误")
+        try:
+            db.update_user(DB_CONN, user["username"],
+                           password_hash=auth.hash_password(new))
+        except ValueError as e:
+            return self._err(400, "bad_request", str(e))
+        # 改完密码后让当前 session 失效（强制重新登录）
+        token = self._cookie_session()
+        if token:
+            db.delete_session(DB_CONN, auth.hash_session_id(token))
+        # 构造响应并附带清 cookie 头
+        body_json = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_json)))
+        self.send_header("X-UCopy-Protocol", "1")
+        self.send_header("Connection", "close")
+        # 清 cookie（必须在 send_response 之后）
+        self.send_header("Set-Cookie",
+            f"{COOKIE_NAME}=deleted; HttpOnly; Secure; Path=/; Max-Age=0")
+        self.end_headers()
+        self.wfile.write(body_json)
+        return None
 
     # ----- launchd -----
     def _api_launchd_status(self):

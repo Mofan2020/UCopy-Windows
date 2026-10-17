@@ -376,6 +376,13 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
     - 文件大小自适应 B/KB/MB/GB；`formatSize()` 工具函数
   - **触发问题**：用户实测 v1.5.1 release 二进制点击登录按钮无反应 + 浏览器 console 报 `ReferenceError`
   - **为什么 v1.5.1 release 漏检**：之前端到端只测了 API (`/api/v1/ping`)，没在浏览器实测 UI 行为
+- **v1.5.4 修改密码 + admin 改他人 + do_PATCH bug fix**：
+  - **自己改密码**：`PUT /api/v1/users/me/password`，需 `old_password` 验证（PBKDF2-SHA256）+ `new_password` ≥ 6 字符；成功后清 session + `Set-Cookie: ... Max-Age=0` 强制重登
+  - **admin 改他人**：`PATCH /api/v1/admin/users/<name>` `{password: ...}`（已存在，admin 角色可改）
+  - **Web UI 同步**：me 卡片下加「修改我的密码」表单（3 字段 + 提交）；admin 表格每行加「改密码」按钮
+  - **顺手修历史 bug**：`server.py` 之前没有 `do_PATCH` handler（`BaseHTTPRequestHandler` 默认不接 PATCH），所以 `PATCH /api/v1/admin/users/<name>` 从 v1.5.0 起就一直 501。补上后 admin 改他人密码/角色/配额才真正可用
+  - **响应头顺序坑**：`send_header("Set-Cookie", ...)` 必须在 `send_response` 之后调，否则 header 落空；改自己密码用 inline 写 response 而不是 `_json + _clear_session_cookie` 两步
+  - **不动的边界**：旧密码忘记 → 仍需 admin 重置；服务端没有「邮箱找回」功能
 - **v1.5.0 → v1.5.1 Web GUI 404 fix**（**严重**，未在 v1.5.1 release 内修）：
   - `server.py` 原来用 `os.path.join(THIS_DIR, "static")` 找 `index.html`，但在 PyInstaller onefile 模式下 `__file__` 指向解压临时目录（只有 `ucopy_server/server.py`），`ucopy_server/static/` 在 `sys._MEIPASS/ucopy_server/static/`
   - 修法：加 `_resolve_static_dir()` 优先查 `sys._MEIPASS/ucopy_server/static`，fallback 源码运行的 `THIS_DIR/static`；`STATIC_DIR` 模块级常量
