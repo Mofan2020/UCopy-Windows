@@ -416,3 +416,13 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
   - 之前 v1.5.1 的端到端测试只测 API（`/api/v1/ping`），没测 Web GUI `/`，所以漏检
   - 教训：onefile 打包后必须测**全路径**（HTML / 静态资源 / API），不能只看 API 通就认为 OK
 - **v1.5.0 旧二进制下载的用户**：先 `./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer --print-admin-password` 拿回旧 admin 密码，下载新二进制覆盖后再起；或 `--init-only` 重生数据。
+- **v1.5.5.2 UCopy 客户端首次连接 self-signed cert 处理修**：
+  - **症状**：「测试连接」点一次后弹「连接失败 [SSL: CERTIFICATE VERIFY_FAILED] certificate verify failed: self-signed certificate」
+  - **根因**：`test_remote` 旧版直接 `client.login()` —— `RemoteClient` 看到 store 里没存 fingerprint → 用 `CERT_REQUIRED`（标准 CA 校验）→ self-signed cert 必抛 `SSLCertVerificationError`，但 `test_remote` 的 `except Exception` 把异常包成 `str(e)` 弹窗，**没有「信任此服务器？」入口**
+  - **修法**（`ucopy.py` `SettingsWindow.test_remote`）：
+    1. 先 `client.get_current_fingerprint()` 用 CERT_NONE ctx 拿 fingerprint（绕开 CA 校验）
+    2. 拿 `store.get_fingerprint(url)`：未存 → 弹 `messagebox.askyesno("信任此服务器？", fp + 防 MITM 说明)` → 用户点是 → `store.trust(url, fp)` → 重新 new client（store 有 fp 走 CERT_NONE + pin）
+    3. 已存但 fingerprint 不一致 → 弹「证书指纹不匹配」错误（已信任 + 当前 fp + 警告：服务器换证书 / 中间人攻击）
+    4. 已存且一致 → 直接 `client.login(user, pw)` 走通
+  - **不动的边界**：RemoteUploader 后台线程撞到 self-signed cert 没有「信任」弹窗入口（GUI 必须在主线程），只能写日志让用户去设置面板点「测试连接」完成首次信任
+  - **不动的边界**：fingerprint 不一致时需要用户手动删 `~/.ucopy_trusted_servers.json`（没做 UI 入口）—— v1.5.0 文档里有提及但没修；下次再补

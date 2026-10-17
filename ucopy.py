@@ -2019,8 +2019,49 @@ class SettingsWindow:
             messagebox.showerror("错误", "remote_client 模块不可用",
                                  parent=self.win)
             return
+        # 第一次自签 cert 会抛 SSLCertVerificationError；先做一次「探测」拿 fingerprint
         try:
             client = remote_client.RemoteClient(url)
+            fp = client.get_current_fingerprint()
+        except Exception as e:
+            messagebox.showerror("连接失败", str(e), parent=self.win)
+            return
+        if not fp:
+            messagebox.showerror("连接失败", "无法获取服务器证书指纹（地址错？HTTPS 端口错？）",
+                                 parent=self.win)
+            return
+        # 拿 store 里的已有 fingerprint
+        store = client.store
+        stored = store.get_fingerprint(url)
+        if stored is None:
+            # 未信任 → 弹窗让用户决定
+            ok = messagebox.askyesno(
+                "信任此服务器？",
+                f"服务器证书指纹（SHA-256）：\n\n{fp}\n\n"
+                f"这是自签证书（首次连接）。\n"
+                f"确认信任后该指纹会保存到 ~/.ucopy_trusted_servers.json，\n"
+                f"以后只接受这个指纹（防 MITM）。\n\n"
+                f"是否信任？",
+                parent=self.win,
+            )
+            if not ok:
+                return
+            store.trust(url, fp)
+        elif stored != fp:
+            # 已有信任但 fingerprint 不一致 → 拒绝
+            messagebox.showerror(
+                "证书指纹不匹配",
+                f"当前服务器指纹与已信任的不一致：\n\n"
+                f"已信任: {stored[:32]}…\n"
+                f"现在  : {fp[:32]}…\n\n"
+                f"服务器可能换了证书，或者有人在中间人攻击。\n"
+                f"要信任新证书请先删除 ~/.ucopy_trusted_servers.json 中此 URL 的记录。",
+                parent=self.win,
+            )
+            return
+        # 信任已建立，重新 new client 让它走 CERT_NONE 路径
+        client = remote_client.RemoteClient(url, store=store)
+        try:
             client.login(user, pw)
             me = client.me()
             messagebox.showinfo("成功",
@@ -2028,18 +2069,15 @@ class SettingsWindow:
                                 f"角色: {me['role']}\n"
                                 f"配额: {me['quota_mb']} MB",
                                 parent=self.win)
-            # 把已存在的指纹写到 trusted store（测试连接就是信任）
-            fp = client.get_current_fingerprint()
-            if fp:
-                client.store.trust(url, fp)
-                self.remote_fp_var.set(fp)
-                self.app.config.setdefault("remote", {})
-                self.app.config["remote"]["trusted_fingerprint"] = fp
-                try:
-                    save_config(self.app.config)
-                except Exception:
-                    pass
-            # 同时让 uploader 拿到 client（如果已启用就直接复用）
+            # 同步 UI 上的 fingerprint 显示
+            self.remote_fp_var.set(fp)
+            self.app.config.setdefault("remote", {})
+            self.app.config["remote"]["trusted_fingerprint"] = fp
+            try:
+                save_config(self.app.config)
+            except Exception:
+                pass
+            # 让 uploader 拿到 client
             self.app._remote_password = pw
             self.app.remote_uploader.configure(
                 server_url=url, username=user, password=pw,
