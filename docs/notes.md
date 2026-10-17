@@ -417,7 +417,7 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
   - 教训：onefile 打包后必须测**全路径**（HTML / 静态资源 / API），不能只看 API 通就认为 OK
 - **v1.5.0 旧二进制下载的用户**：先 `./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer --print-admin-password` 拿回旧 admin 密码，下载新二进制覆盖后再起；或 `--init-only` 重生数据。
 - **v1.5.5.2 UCopy 客户端首次连接 self-signed cert 处理修**：
-  - **症状**：「测试连接」点一次后弹「连接失败 [SSL: CERTIFICATE VERIFY_FAILED] certificate verify failed: self-signed certificate」
+  - **症状**：「测试连接」点一次后弹「连接失败 [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate」
   - **根因**：`test_remote` 旧版直接 `client.login()` —— `RemoteClient` 看到 store 里没存 fingerprint → 用 `CERT_REQUIRED`（标准 CA 校验）→ self-signed cert 必抛 `SSLCertVerificationError`，但 `test_remote` 的 `except Exception` 把异常包成 `str(e)` 弹窗，**没有「信任此服务器？」入口**
   - **修法**（`ucopy.py` `SettingsWindow.test_remote`）：
     1. 先 `client.get_current_fingerprint()` 用 CERT_NONE ctx 拿 fingerprint（绕开 CA 校验）
@@ -426,3 +426,8 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
     4. 已存且一致 → 直接 `client.login(user, pw)` 走通
   - **不动的边界**：RemoteUploader 后台线程撞到 self-signed cert 没有「信任」弹窗入口（GUI 必须在主线程），只能写日志让用户去设置面板点「测试连接」完成首次信任
   - **不动的边界**：fingerprint 不一致时需要用户手动删 `~/.ucopy_trusted_servers.json`（没做 UI 入口）—— v1.5.0 文档里有提及但没修；下次再补
+- **v1.5.5.3 UCopy 客户端 test_remote 不存 server_url/username 修**：
+  - **症状**：用户在「测试连接」填了 server_url + username + password → 弹「信任此服务器？」点「是」→ 登录成功 → 关掉设置面板再打开 → server_url / username 输入框是空的（password 设计上就不存）
+  - **根因**：`test_remote` 成功路径**只**写 `trusted_fingerprint` 到 cfg，没写 server_url / username / auto_upload。设置面板下次打开从 cfg 读 `""` → 输入框空
+  - **修法**：`test_remote` 成功路径加 `update({server_url, username, auto_upload, trusted_fingerprint})` 一并写盘
+  - **password 仍然不存**（用户硬性偏好：「仅本会话使用，重启后要重新输入」），源码断言守住 `_src.count('"password"') == 0`

@@ -2071,8 +2071,15 @@ class SettingsWindow:
                                 parent=self.win)
             # 同步 UI 上的 fingerprint 显示
             self.remote_fp_var.set(fp)
+            # 写回 server_url / username / auto_upload 到 cfg (v1.5.5.3)
+            # password 故意不存盘（用户硬性偏好：仅本次会话）
             self.app.config.setdefault("remote", {})
-            self.app.config["remote"]["trusted_fingerprint"] = fp
+            self.app.config["remote"].update({
+                "server_url": url,
+                "username": user,
+                "auto_upload": bool(self.remote_auto_var.get()),
+                "trusted_fingerprint": fp,
+            })
             try:
                 save_config(self.app.config)
             except Exception:
