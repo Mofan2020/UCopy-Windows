@@ -40,18 +40,26 @@ def get_status() -> str:
     return "running"
 
 
-def install(exec_cmd: str) -> bool:
+def install(args) -> bool:
     """
     写 plist + launchctl load -w
 
-    exec_cmd: 完整命令，例如
-        /usr/bin/python3 /Users/.../ucopy-server/server.py
+    args: 命令参数列表，例如
+        ["/usr/bin/python3", "/Users/.../ucopy-server/server.py", "--detach"]
+    或直接传字符串（兼容旧用法：exec_cmd = "/usr/bin/python3 /path/server.py"）
     """
     if platform.system() != "Darwin":
         print("launchd 自启动仅 macOS 支持", file=sys.stderr)
         return False
     plist_dir = os.path.dirname(plist_path())
     os.makedirs(plist_dir, exist_ok=True)
+
+    # 兼容旧调用：exec_cmd 字符串
+    if isinstance(args, str):
+        # 旧用法：把字符串当成一个 ProgramArguments 项（用 /bin/sh -c 包装）
+        program_args = ["/bin/sh", "-c", args]
+    else:
+        program_args = list(args)
 
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -60,9 +68,7 @@ def install(exec_cmd: str) -> bool:
   <key>Label</key><string>{LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/sh</string>
-    <string>-c</string>
-    <string>{_xml_escape(exec_cmd)}</string>
+{chr(10).join(f'    <string>{_xml_escape(a)}</string>' for a in program_args)}
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>

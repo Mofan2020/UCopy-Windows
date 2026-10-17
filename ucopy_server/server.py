@@ -200,14 +200,17 @@ class UCRequestHandler(BaseHTTPRequestHandler):
         return user
 
     def _set_session_cookie(self, token: str):
+        # v1.7.0: HTTP 模式下不发 Secure flag（否则 cookie 客户端会拒绝，session 失效）
+        secure = "Secure; " if not (CFG or {}).get("disable_https") else ""
         cookie = (
-            f"{COOKIE_NAME}={token}; HttpOnly; Secure; SameSite=Strict; "
+            f"{COOKIE_NAME}={token}; HttpOnly; {secure}SameSite=Strict; "
             f"Path=/; Max-Age={SESSIONS_TTL}"
         )
         self.send_header("Set-Cookie", cookie)
 
     def _clear_session_cookie(self):
-        cookie = f"{COOKIE_NAME}=deleted; HttpOnly; Secure; Path=/; Max-Age=0"
+        secure = "Secure; " if not (CFG or {}).get("disable_https") else ""
+        cookie = f"{COOKIE_NAME}=deleted; HttpOnly; {secure}Path=/; Max-Age=0"
         self.send_header("Set-Cookie", cookie)
 
     # ----- 路由分发 -----
@@ -298,6 +301,14 @@ class UCRequestHandler(BaseHTTPRequestHandler):
                 return self._api_launchd_install()
             if path == "/api/v1/launchd/uninstall" and method == "POST":
                 return self._api_launchd_uninstall()
+
+            # v1.7.0: 强制 HTTP 模式开关 + 服务重启
+            if path == "/api/v1/system" and method == "GET":
+                return self._api_system_get()
+            if path == "/api/v1/system" and method == "PUT":
+                return self._api_system_update()
+            if path == "/api/v1/system/restart" and method == "POST":
+                return self._api_system_restart()
 
             # v1.6.0: API key 管理（需 user session 登录）
             if path == "/api/v1/keys" and method == "GET":
@@ -899,8 +910,24 @@ class UCRequestHandler(BaseHTTPRequestHandler):
         if launchd.is_installed():
             return self._err(409, "already_installed", "已经安装过")
         # 拼出自启动命令：复用当前 python + 当前 server.py 路径
-        exec_cmd = f"{sys.executable} {os.path.abspath(__file__)}"
-        ok = launchd.install(exec_cmd)
+        # v1.7.0: 强制带 --detach（用户硬性偏好："服务程序无论是...当前启动为launchd自启动，
+        # 都使用detach模式（无法指定为其他）"）。同时把当前模式（端口 + disable_https）一起带上。
+        cfg = get_cfg()
+        data_dir = cfg.get("data_dir") or os.path.join(
+            os.path.expanduser("~"), "UCopyServer")
+        prog_args = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--data-dir", data_dir,
+            "--detach",
+        ]
+        if cfg.get("port"):
+            prog_args.extend(["--port", str(int(cfg["port"]))])
+        if cfg.get("bind_host"):
+            prog_args.extend(["--bind-host", cfg["bind_host"]])
+        if cfg.get("disable_https"):
+            prog_args.append("--disable-https")
+        ok = launchd.install(prog_args)
         return self._json(200 if ok else 500, {
             "ok": ok,
             "installed": launchd.is_installed(),
@@ -917,6 +944,122 @@ class UCRequestHandler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": ok,
                                 "installed": launchd.is_installed(),
                                 "status": launchd.get_status()})
+
+    # ----- v1.7.0: system (HTTP/HTTPS 模式 + restart) -----
+    def _api_system_get(self):
+        """返回服务器当前模式（http/https 状态、port、是否 launchd 管控）。"""
+        user = self._require_user()
+        if user is None:
+            return self._err(401, "unauthenticated", "未登录")
+        return self._json(200, {
+            "ok": True,
+            "scheme": "http" if CFG.get("disable_https") else "https",
+            "disable_https": bool(CFG.get("disable_https")),
+            "port": int(CFG.get("port") or 8443),
+            "bind_host": CFG.get("bind_host", "::"),
+            "managed_by_launchd": bool(launchd.is_installed()) if sys.platform == "darwin" else False,
+            # 重启后实际生效要靠 kill 自身 + detach 重启 / launchctl kickstart
+            "restart_supported": True,
+        })
+
+    def _api_system_update(self):
+        """修改 disable_https。**必须调用 /api/v1/system/restart 才生效**。"""
+        user = self._require_user("admin")
+        if user is None:
+            return self._err(401, "unauthenticated", "未登录")
+        if user is False:
+            return self._err(403, "forbidden", "需要 admin")
+        body = self._read_json() or {}
+        if "disable_https" not in body:
+            return self._err(400, "bad_request", "缺少 disable_https 字段")
+        new_val = bool(body["disable_https"])
+        old_val = bool(CFG.get("disable_https"))
+        if new_val == old_val:
+            return self._json(200, {
+                "ok": True,
+                "disable_https": old_val,
+                "changed": False,
+                "restart_required": False,
+            })
+        CFG["disable_https"] = new_val
+        from ucopy_server import config as _server_config
+        _server_config.save(CFG)
+        # 同步 launchd plist（让 launchd 启动时用上正确模式）
+        if sys.platform == "darwin" and launchd.is_installed():
+            try:
+                import plistlib as _pl
+                plist_path = launchd.plist_path()
+                plist = _pl.load(open(plist_path, "rb"))
+                # 保留原 ProgramArguments 形式（v1.6.x 是 [/bin/sh, -c, "<exec>"]），
+                # 只追加 / 移除 --disable-https 标志，不要把 list 形式直接覆盖上去
+                # —— 那会把旧的 /bin/sh 形式（兼容老 plist）破坏掉
+                args = list(plist.get("ProgramArguments", []))
+                if new_val and "--disable-https" not in args:
+                    args.append("--disable-https")
+                elif not new_val:
+                    args = [a for a in args if a != "--disable-https"]
+                plist["ProgramArguments"] = args
+                with open(plist_path, "wb") as f:
+                    _pl.dump(plist, f)
+                LOG.info(f"[system] launchd plist 同步 disable_https={new_val}")
+            except Exception as e:
+                LOG.warning(f"[system] 同步 launchd plist 失败: {e}")
+        return self._json(200, {
+            "ok": True,
+            "disable_https": new_val,
+            "changed": True,
+            "restart_required": True,
+            "next_url": f"{'http' if new_val else 'https'}://localhost:{CFG['port']}/",
+        })
+
+    def _api_system_restart(self):
+        """重启服务（自杀 + 自动重启）。
+
+        策略：
+          - 当前进程是 launchd 启动的（PPID=1 且 $LAUNCHED_BY_LAUNCHD=1）
+            → launchctl kickstart -k（launchd 会重读 plist + 重启进程）
+          - 其他情况 → 当前进程 os._exit(0) 立即终止（不调 httpd.shutdown()，避免在
+            serve_forever 线程里调 shutdown 死锁）；服务依赖外部 --detach 重启或
+            启动 launchd / 用户手动
+        """
+        import subprocess as _sp
+        user = self._require_user("admin")
+        if user is None:
+            return self._err(401, "unauthenticated", "未登录")
+        if user is False:
+            return self._err(403, "forbidden", "需要 admin")
+        # 立即返回响应（client 不阻塞）
+        self._json(200, {"ok": True, "restarting": True})
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+        # 判断当前进程是否由 launchd 启动（PPID=1 + 环境变量）
+        # 不用 is_installed()：plist 装了不代表当前这个进程就是它启动的
+        launched_by_launchd = (
+            sys.platform == "darwin"
+            and os.getppid() == 1
+            and os.environ.get("LAUNCHED_BY_LAUNCHD") == "1"
+            and launchd.is_installed()
+        )
+        if launched_by_launchd:
+            try:
+                LOG.info("[system] launchd 管理的进程：通过 launchctl kickstart -k 重启")
+                # macOS launchd target 格式必须为 gui/<uid>/<label>，只传 label 会报
+                # "Unrecognized target specifier"。uid 从 os.getuid() 取。
+                _target = f"gui/{os.getuid()}/{launchd.LABEL}"
+                _sp.Popen(["launchctl", "kickstart", "-k", _target],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                import threading as _t
+                _t.Timer(0.5, lambda: os._exit(0)).start()
+                return
+            except Exception as e:
+                LOG.warning(f"[system] launchctl kickstart 失败: {e}，回退到 os._exit")
+        # 非 launchd 启动的进程：直接 _exit
+        LOG.info(f"[system] 收到 restart 请求，进程立即退出"
+                 f"（launchd 启动={launched_by_launchd}；依赖外部 --detach / 手动重启）")
+        import threading as _t
+        _t.Timer(0.3, lambda: os._exit(0)).start()
 
     # ----- multipart -----
     def _parse_multipart(self, content_type: str):
@@ -1040,7 +1183,10 @@ def _platform():
 
 # ---------- main ----------
 def make_server(cfg: dict, httpd):
-    """wrap httpd with TLS（基于已有 ctx）。"""
+    """wrap httpd with TLS（基于已有 ctx）。v1.7.0: cfg['disable_https']=True 时不加载 TLS。"""
+    if cfg.get("disable_https"):
+        # HTTP 模式：不加载证书，不 wrap socket
+        return httpd
     cert_path, key_path = cert.ensure_cert(cfg["data_dir"])
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -1118,6 +1264,10 @@ def run():
         cfg["port"] = args.port
     if args.bind_host:
         cfg["bind_host"] = args.bind_host
+    # v1.7.0: --disable-https 写进 cfg（持久化）
+    if args.disable_https:
+        cfg["disable_https"] = True
+    # CLI 显式传 --no-disable-https 不存在（action 没 store_false），但首次生成时默认 False
     cfg["data_dir"] = args.data_dir or cfg.get("data_dir") or server_config.DEFAULT_DATA_DIR
     init_app(cfg)
 
@@ -1172,10 +1322,53 @@ def run():
             # (后续会做 PID 文件清理 / 信号处理)
 
     # macOS launchd 默认启用（如未禁用）—— detach 模式下不冲突，但也不需要
-    if sys.platform == "darwin" and not args.no_autostart and not args.detach and not launchd.is_installed():
+    # v1.7.0: launchd 自启动必须 detach 模式（用户原话："服务程序无论是...当前启动为launchd自启动，
+    # 都使用detach模式（无法指定为其他）"）
+    if sys.platform == "darwin" and not args.no_autostart and not launchd.is_installed():
         LOG.info("[launchd] 首次启动，注册自启动到 ~/Library/LaunchAgents/")
-        ok = launchd.install(f"{sys.executable} {os.path.abspath(__file__)}")
+        prog_args = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--data-dir", data_dir,
+            "--detach",  # ← 强制 detach，无法指定为其他
+        ]
+        # 把当前模式（端口 + disable_https）也带进去，让 launchd 启动时就用上正确配置
+        prog_args.extend(["--port", str(int(cfg["port"]))])
+        if cfg.get("bind_host"):
+            prog_args.extend(["--bind-host", cfg["bind_host"]])
+        if cfg.get("disable_https"):
+            prog_args.append("--disable-https")
+        ok = launchd.install(prog_args)
         LOG.info(f"[launchd] 注册{'成功' if ok else '失败'}")
+    # v1.7.0: 若 launchd 已安装但 plist 里没有 --detach（v1.6.x 升级上来），
+    # 重新 install 一下把 --detach 加进 plist。Install 是幂等的（先 uninstall 再 install）。
+    elif sys.platform == "darwin" and not args.no_autostart and launchd.is_installed():
+        try:
+            plist_content = open(launchd.plist_path(), encoding="utf-8").read()
+            if "--detach" not in plist_content:
+                LOG.info("[launchd] 检测到旧版 plist 缺 --detach，重新注册")
+                # 重新走一遍 install 流程
+                prog_args = [
+                    sys.executable,
+                    os.path.abspath(__file__),
+                    "--data-dir", data_dir,
+                    "--detach",
+                ]
+                prog_args.extend(["--port", str(int(cfg["port"]))])
+                if cfg.get("bind_host"):
+                    prog_args.extend(["--bind-host", cfg["bind_host"]])
+                if cfg.get("disable_https"):
+                    prog_args.append("--disable-https")
+                # 不卸载直接重写（保留 service 状态）
+                import plistlib as _pl
+                plist = _pl.load(open(launchd.plist_path(), "rb"))
+                plist["ProgramArguments"] = prog_args
+                with open(launchd.plist_path(), "wb") as f:
+                    _pl.dump(plist, f)
+                # 重启 launchd 服务让它重读 plist
+                LOG.info(f"[launchd] plist 已更新（新增 --detach）")
+        except Exception as e:
+            LOG.warning(f"[launchd] 检查/更新 plist 失败: {e}")
 
     # 默认 IPv6 双栈（`::` + IPV6_V6ONLY=0），用户也可传 [::] / 具体 IPv6 / 0.0.0.0
     ThreadingHTTPSServer.address_family = _server_address_family(cfg["bind_host"])
@@ -1197,9 +1390,11 @@ def run():
     disp_host = cfg["bind_host"]
     if ":" in disp_host and not (disp_host.startswith("[") and disp_host.endswith("]")):
         disp_host = f"[{disp_host}]"
-    LOG.info(f"UCopy Server 启动: https://{disp_host}:{cfg['port']}")
+    scheme = "http" if cfg.get("disable_https") else "https"
+    LOG.info(f"UCopy Server 启动: {scheme}://{disp_host}:{cfg['port']}")
     LOG.info(f"数据目录: {cfg['data_dir']}")
-    LOG.info(f"Web GUI:   https://localhost:{cfg['port']}/（双栈 → 也能用 https://127.0.0.1:{cfg['port']}/）")
+    LOG.info(f"Web GUI:   {scheme}://localhost:{cfg['port']}/"
+             f"（双栈 → 也能用 {scheme}://127.0.0.1:{cfg['port']}/）")
 
     def _shutdown(*_):
         LOG.info("收到退出信号，正在关闭...")

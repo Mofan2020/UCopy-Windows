@@ -338,6 +338,19 @@
     </div>
 
     <div class="card">
+      <h2>服务器模式</h2>
+      <div id="system-status" class="muted">加载中…</div>
+      <div class="row" style="margin-top:12px; gap:14px; align-items:center">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="cb-disable-https">
+          <span>强制使用 HTTP（不使用 HTTPS）</span>
+        </label>
+        <button class="primary" id="btn-system-apply">应用并重启</button>
+      </div>
+      <div class="faint" style="margin-top:8px">注意：更改后必须重启服务才会生效，客户端也需要把地址从 https:// 改成 http://（或反之）。</div>
+    </div>
+
+    <div class="card">
       <h2>文件浏览</h2>
       <div class="breadcrumb" id="path-nav"></div>
       <div id="files"></div>
@@ -449,6 +462,7 @@
         loadUsers();
       }
       loadLaunchd();
+      loadSystem();
       loadFiles();
       loadConfig();
       loadKeys();
@@ -691,6 +705,58 @@
     else { toast('卸载失败：' + (data.error || '未知'), 'err'); loadLaunchd(); }
   }
 
+  // ---- v1.7.0: server mode (http/https) ----
+  async function loadSystem() {
+    var data = await api('GET', '/api/v1/system');
+    if (!data.ok) {
+      $('system-status').innerHTML = '<span class="err">' + escapeHtml(data.error || '加载失败') + '</span>';
+      return;
+    }
+    var scheme = data.scheme;
+    var schemeBadge = scheme === 'https'
+      ? '<span class="ok">HTTPS</span>'
+      : '<span class="warn">HTTP</span>';
+    var managed = data.managed_by_launchd
+      ? '（launchd 管理）'
+      : (data.managed_by_launchd === false ? '（未受 launchd 管控）' : '');
+    $('system-status').innerHTML =
+      '<div class="row between"><div>当前协议：<b>' + schemeBadge + '</b></div>' +
+      '<div>端口：<b>' + escapeHtml(String(data.port)) + '</b></div></div>' +
+      '<div class="faint" style="margin-top:6px">监听：<code>' + escapeHtml(data.bind_host) + '</code> ' + managed + '</div>';
+    $('cb-disable-https').checked = !!data.disable_https;
+  }
+  async function doApplySystem() {
+    var newVal = $('cb-disable-https').checked;
+    var confirmMsg = newVal
+      ? '切换到 HTTP 模式？\n\n服务器会立即重启（约 1 秒后自动回来）。\n\n' +
+        '重启后请把浏览器地址栏的 https:// 改成 http:// 再刷新。\n\n' +
+        '注意：HTTP 模式下数据传输不加密，仅在安全的内网使用。\n\n确定吗？'
+      : '切换到 HTTPS 模式？\n\n服务器会立即重启（约 1 秒后自动回来）。\n\n' +
+        '重启后请把浏览器地址栏的 http:// 改成 https:// 再刷新。\n\n确定吗？';
+    if (!confirm(confirmMsg)) {
+      loadSystem();
+      return;
+    }
+    var data = await api('PUT', '/api/v1/system', { disable_https: newVal });
+    if (!data.ok) {
+      toast('修改失败：' + (data.error || '未知'), 'err');
+      loadSystem();
+      return;
+    }
+    if (!data.changed) {
+      toast('已经是目标模式', 'ok');
+      return;
+    }
+    // 触发重启
+    toast('配置已保存，正在重启服务...', 'ok');
+    var restartData = await api('POST', '/api/v1/system/restart');
+    if (!restartData.ok) {
+      toast('重启指令发送失败：' + (restartData.error || '未知'), 'err');
+    }
+    // 等服务回来
+    setTimeout(function() { window.location.href = data.next_url; }, 2500);
+  }
+
   // ---- files ----
   function renderBreadcrumb() {
     var parts = currentPath ? currentPath.split('/') : [];
@@ -810,6 +876,7 @@
   bind('btn-close-key', function() { $('new-key-result').style.display = 'none'; });
   bind('btn-install', doInstallLaunchd);
   bind('btn-uninstall', doUninstallLaunchd);
+  bind('btn-system-apply', doApplySystem);
   bind('btn-load-cfg', loadConfig);
   bind('btn-save-cfg', saveConfig);
   bindEnter('login-password', doLogin);

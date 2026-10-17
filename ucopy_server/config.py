@@ -40,6 +40,9 @@ DEFAULT_CONFIG = {
     },
     # macOS 自启动：launchd plist 文件名（com.skyc8266.ucopy-server 前缀约定）
     "launchd_label": "com.skyc8266.ucopy-server",
+    # v1.7.0: 强制禁用 HTTPS（仅 HTTP）；CLI --disable-https / Web GUI 设置。
+    # 切换后必须重启服务才能生效。
+    "disable_https": False,
 }
 
 
@@ -69,6 +72,12 @@ def parse_args(argv=None):
                         help="后台模式下的日志文件路径（默认 <data-dir>/server.log）")
     parser.add_argument("--pid-file",
                         help="后台模式下的 PID 文件路径（默认 <data-dir>/server.pid）")
+    # v1.7.0: 强制 HTTP（不加载 TLS）
+    parser.add_argument("--disable-https", action="store_true",
+                        help="强制使用 HTTP 而非 HTTPS（v1.7.0+）\n"
+                             "默认端口 8443 同时适用于 HTTP/HTTPS；\n"
+                             "切换后必须重启服务才能生效；\n"
+                             "持久化到 <data-dir>/server.json。")
     return parser.parse_args(argv)
 
 
