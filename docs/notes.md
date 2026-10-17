@@ -365,6 +365,17 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
   - `ThreadingHTTPServer.server_bind` 之前开 `IPV6_V6ONLY=0`
   - 绑定错误提示改成 5 行可读（含 v4-only、v6-only、双栈、具体地址场景）
   - 启动日志里 IPv6 hostname 自动加方括号
+- **v1.5.2 Web UI 重写 + ReferenceError 修复**：
+  - **根因**：原 `index.html` 用 `onclick="login()"` 等 inline event handler，调用 `async function login() { ... }`；在 Safari 严格模式 + 异步上下文里 inline handler 偶尔找不到 global async 函数，抛 `ReferenceError: Can't find variable: login`
+  - **修法**：所有按钮改用 `addEventListener` 绑定；函数全部包在 IIFE `(function() { 'use strict'; ... })()` 里避免全局污染；通过 `data-*` 属性 + 事件代理处理动态生成元素的回调（用户列表 / 文件列表 / 面包屑）
+  - **UI 美观（同步重做）**：
+    - 配色：`#8B5CF6` 紫色主题（沿用 UCopy 浮点 + DeepSleep / TorSOCKS5 等项目风格），深色模式自适应 `prefers-color-scheme`
+    - 卡片：14px 圆角 + `backdrop-filter: blur(20px)` 毛玻璃 + 细描边
+    - 状态：进度条（配额用满率）、toast 提示、role-badge 徽章、面包屑导航
+    - 安全：`escapeHtml()` 防 XSS；用户输入 `parseInt` + 边界检查
+    - 文件大小自适应 B/KB/MB/GB；`formatSize()` 工具函数
+  - **触发问题**：用户实测 v1.5.1 release 二进制点击登录按钮无反应 + 浏览器 console 报 `ReferenceError`
+  - **为什么 v1.5.1 release 漏检**：之前端到端只测了 API (`/api/v1/ping`)，没在浏览器实测 UI 行为
 - **v1.5.0 → v1.5.1 Web GUI 404 fix**（**严重**，未在 v1.5.1 release 内修）：
   - `server.py` 原来用 `os.path.join(THIS_DIR, "static")` 找 `index.html`，但在 PyInstaller onefile 模式下 `__file__` 指向解压临时目录（只有 `ucopy_server/server.py`），`ucopy_server/static/` 在 `sys._MEIPASS/ucopy_server/static/`
   - 修法：加 `_resolve_static_dir()` 优先查 `sys._MEIPASS/ucopy_server/static`，fallback 源码运行的 `THIS_DIR/static`；`STATIC_DIR` 模块级常量
