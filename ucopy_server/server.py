@@ -838,8 +838,11 @@ def run():
         sys.exit(1)
     httpd = make_server(cfg, httpd)
 
-    bind_disp = f"[{cfg['bind_host']}]" if ":" in cfg["bind_host"] else cfg["bind_host"]
-    LOG.info(f"UCopy Server 启动: https://{bind_disp}:{cfg['port']}")
+    # 启动日志显示：剥掉已剥过的方括号，避免 [[::]] 双重包裹
+    disp_host = cfg["bind_host"]
+    if ":" in disp_host and not (disp_host.startswith("[") and disp_host.endswith("]")):
+        disp_host = f"[{disp_host}]"
+    LOG.info(f"UCopy Server 启动: https://{disp_host}:{cfg['port']}")
     LOG.info(f"数据目录: {cfg['data_dir']}")
     LOG.info(f"Web GUI:   https://localhost:{cfg['port']}/（双栈 → 也能用 https://127.0.0.1:{cfg['port']}/）")
 
