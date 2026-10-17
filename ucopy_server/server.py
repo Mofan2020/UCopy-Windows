@@ -868,6 +868,7 @@ def run():
     # PyInstaller onefile 打包后 sys.path 上没有当前目录；
     # 显式 import 走 ucopy_server 包，避免 'No module named config'。
     from ucopy_server import config as server_config
+    from ucopy_server import detach as server_detach
     args = server_config.parse_args()
     cfg = server_config.load_or_init(
         args.data_dir or server_config.DEFAULT_DATA_DIR
@@ -885,8 +886,52 @@ def run():
     if args.init_only:
         return
 
-    # macOS launchd 默认启用（如未禁用）
-    if sys.platform == "darwin" and not args.no_autostart and not launchd.is_installed():
+    # ---- 后台模式：--stop / --detach 互斥 + 早处理 ----
+    data_dir = cfg["data_dir"]
+    log_file = args.log_file or os.path.join(data_dir, "server.log")
+    pid_file = args.pid_file or os.path.join(data_dir, "server.pid")
+
+    if args.stop:
+        ok, msg = server_detach.stop(pid_file)
+        print(f"{'OK' if ok else 'FAIL'}: {msg}")
+        sys.exit(0 if ok else 1)
+
+    if args.detach:
+        # 先看是不是已经有 detached 进程在跑
+        existing = server_detach.is_already_running(pid_file)
+        if existing is not None:
+            print(f"FAIL: PID {existing} 已在运行（{pid_file}）；先 --stop 再试")
+            sys.exit(1)
+
+        if sys.platform == "win32":
+            # Windows: detach = 用 Popen 重启自己，父进程立刻 exit
+            new_pid = server_detach.detach(log_file, pid_file)
+            if new_pid > 0:
+                print(f"[detached] PID={new_pid} 正在后台运行；日志: {log_file}")
+                print(f"[detached] 停止: <exe> --data-dir {data_dir} --stop")
+                sys.exit(0)
+            else:
+                print(f"[detached] 启动失败，详见 {log_file}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            # Unix: _daemonize_unix 会 fork；父进程会拿到子 PID
+            new_pid = server_detach.detach(log_file, pid_file)
+            if new_pid > 0:
+                # 父进程路径：等 PID 文件出现（子进程异步写）
+                for _ in range(100):
+                    if os.path.exists(pid_file):
+                        break
+                    time.sleep(0.01)
+                actual_pid = server_detach.read_pid(pid_file) or new_pid
+                print(f"[detached] PID={actual_pid} 正在后台运行；日志: {log_file}")
+                print(f"[detached] 停止: <exe> --data-dir {data_dir} --stop")
+                print(f"[detached] 父进程退出，可关掉此终端")
+                sys.exit(0)
+            # new_pid == 0 说明是 daemon 进程本身，继续走服务启动
+            # (后续会做 PID 文件清理 / 信号处理)
+
+    # macOS launchd 默认启用（如未禁用）—— detach 模式下不冲突，但也不需要
+    if sys.platform == "darwin" and not args.no_autostart and not args.detach and not launchd.is_installed():
         LOG.info("[launchd] 首次启动，注册自启动到 ~/Library/LaunchAgents/")
         ok = launchd.install(f"{sys.executable} {os.path.abspath(__file__)}")
         LOG.info(f"[launchd] 注册{'成功' if ok else '失败'}")

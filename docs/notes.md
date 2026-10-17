@@ -383,6 +383,23 @@ systematic-debugging 的纪律重新调查，定位出**四个独立的根因**�
   - **顺手修历史 bug**：`server.py` 之前没有 `do_PATCH` handler（`BaseHTTPRequestHandler` 默认不接 PATCH），所以 `PATCH /api/v1/admin/users/<name>` 从 v1.5.0 起就一直 501。补上后 admin 改他人密码/角色/配额才真正可用
   - **响应头顺序坑**：`send_header("Set-Cookie", ...)` 必须在 `send_response` 之后调，否则 header 落空；改自己密码用 inline 写 response 而不是 `_json + _clear_session_cookie` 两步
   - **不动的边界**：旧密码忘记 → 仍需 admin 重置；服务端没有「邮箱找回」功能
+- **v1.5.5 后台模式（--detach / --stop）**：
+  - **用户需求**：「启动时加参数就能后台运行 + 关掉命令行窗口服务不中断」
+  - **方案**：fork / spawn 子进程后父进程 exit，子进程继续服务
+    - macOS / Linux：标准 double-fork daemonize（`os.fork` + `os.setsid` + IO 重定向）
+    - Windows：`subprocess.Popen` + `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`
+  - **新模块**：`ucopy_server/detach.py`
+    - `read_pid / write_pid / remove_pid / is_pid_alive`（跨平台：Unix 用 `kill -0`，Windows 用 `OpenProcess + GetExitCodeProcess`）
+    - `stop(pid_file, timeout=5)`：SIGTERM 等 5s → SIGKILL 强杀，过程中清 stale pid 文件
+    - `detach(log_file, pid_file)`：平台分发
+    - `is_already_running(pid_file)`：重复 detach 检测
+  - **新 CLI 参数**（`config.py`）：`--detach` / `--stop` / `--log-file` / `--pid-file`
+  - **默认路径**：log = `<data-dir>/server.log`，pid = `<data-dir>/server.pid`
+  - **detach 模式不注册 launchd**：避免和 launchd 重复管理
+  - **实测**（macOS arm64 本地 build）：
+    - `--detach` 父进程 exit=0，子进程 PID 写入 pid_file，端口 18600 LISTEN，curl `/api/v1/ping` 200
+    - `--stop` 检测 PID 44605 已退出 → 自动清 stale pid 文件 → `OK: ...` 退出 0
+  - **文档**：中英 README 各加「macOS 服务器」独立段（默认数据路径表 + 完整 CLI 参数表 + 后台模式 vs 前台模式对比）
 - **v1.5.0 → v1.5.1 Web GUI 404 fix**（**严重**，未在 v1.5.1 release 内修）：
   - `server.py` 原来用 `os.path.join(THIS_DIR, "static")` 找 `index.html`，但在 PyInstaller onefile 模式下 `__file__` 指向解压临时目录（只有 `ucopy_server/server.py`），`ucopy_server/static/` 在 `sys._MEIPASS/ucopy_server/static/`
   - 修法：加 `_resolve_static_dir()` 优先查 `sys._MEIPASS/ucopy_server/static`，fallback 源码运行的 `THIS_DIR/static`；`STATIC_DIR` 模块级常量

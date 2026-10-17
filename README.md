@@ -237,6 +237,88 @@ Output: `dist/UCopy-Server-macos-arm64` (~9.5 MB). Run it with `./UCopy-Server-m
 
 CI: pushing a tag (e.g. `v1.5.0`) triggers `.github/workflows/build-server.yml`, which builds on `macos-14` (arm64) and uploads the artifact `UCopy-Server-macos-arm64` to the GitHub Release.
 
+### Default Data Path
+
+| Platform | Default data directory | Notes |
+|---|---|---|
+| macOS / Linux | `~/UCopyServer/` | Self-signed cert, SQLite DB, uploaded files all live here |
+| Windows | `%USERPROFILE%\UCopyServer\` | Same layout |
+
+Contents of the data directory:
+
+| File | Purpose |
+|---|---|
+| `server.json` | Listening port, bind address, initial admin account config |
+| `server.db` | SQLite: users / sessions / file_index |
+| `server.log` | Log output in `--detach` mode (default path) |
+| `server.pid` | PID file in `--detach` mode (default path) |
+| `cert.pem` / `key.pem` | Self-signed HTTPS cert (auto-generated on first run) |
+| `files/<username>/` | Files uploaded by that user (per-user subdirectory) |
+
+### Command-Line Options
+
+```bash
+UCopy-Server-macos-arm64 [options]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--port PORT` | 8443 | HTTPS listening port |
+| `--bind-host HOST` | `::` (IPv6 dual-stack, accepts IPv4 mapped) | Bind address; `0.0.0.0` for IPv4-only; `127.0.0.1` for localhost; specific IPv6 like `2409:8a1e:...` |
+| `--data-dir DIR` | `~/UCopyServer/` | Data directory |
+| `--detach` | — | Run in background: fork a child process, the parent exits, the child keeps serving; logs go to `<data-dir>/server.log`; you can close the launching terminal |
+| `--stop` | — | Stop a `--detach`ed background process (reads `server.pid`, sends SIGTERM, escalates to SIGKILL after 5s) |
+| `--log-file PATH` | `<data-dir>/server.log` | Custom log file path |
+| `--pid-file PATH` | `<data-dir>/server.pid` | Custom PID file path |
+| `--init-only` | — | Only initialize (write self-signed cert + admin password), don't start the service |
+| `--print-admin-password` | — | Print the current admin password to stdout (when you forget it) |
+| `--no-autostart` | — | Don't register macOS launchd autostart (registered by default on first launch) |
+
+### Background Mode (Recommended)
+
+**Start** (background, terminal-close-safe):
+
+```bash
+./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer --detach
+# Output:
+# [detached] PID=12345 正在后台运行；日志: /Users/you/UCopyServer/server.log
+# [detached] 停止: <exe> --data-dir /Users/you/UCopyServer --stop
+# [detached] 父进程退出，可关掉此终端
+```
+
+Close the launching terminal — the server keeps running.
+
+**View logs**:
+
+```bash
+tail -f ~/UCopyServer/server.log
+```
+
+**Stop**:
+
+```bash
+./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer --stop
+# Output:
+# OK: PID 12345 已停止
+```
+
+**Notes**:
+
+- `--detach` does NOT register macOS launchd (avoids double-management with launchd)
+- Re-running `--detach` while one is already running will fail — run `--stop` first
+- A stale `server.pid` (process dead, file still there) is auto-cleaned by `--stop`
+- After a macOS reboot, `--detach`ed processes do NOT auto-start — use `--install-launchd` for that, or configure `~/Library/LaunchAgents/com.skyc8266.ucopy-server.plist`
+
+### Foreground Mode (Development)
+
+```bash
+./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer
+```
+
+- Holds the current terminal; service is ready when you see `[INFO] UCopy Server 启动: https://[::]:8443`
+- `Ctrl+C` to stop
+- On macOS, the first launch auto-registers launchd autostart (unless `--no-autostart`)
+
 ## Tech Stack
 
 - Python 3.11+

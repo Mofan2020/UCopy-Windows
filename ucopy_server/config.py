@@ -59,6 +59,16 @@ def parse_args(argv=None):
                         help="只初始化（写 self-signed 证书 + admin 密码），不启动服务")
     parser.add_argument("--print-admin-password", action="store_true",
                         help="打印当前 admin 密码到终端")
+    # 后台模式（v1.5.5）
+    parser.add_argument("--detach", action="store_true",
+                        help="后台运行：fork 子进程后父进程退出，子进程继续服务；"
+                             "日志写到 --data-dir/server.log；可关掉启动的终端")
+    parser.add_argument("--stop", action="store_true",
+                        help="停止已 detach 的后台进程（读 server.pid 发 SIGTERM）")
+    parser.add_argument("--log-file",
+                        help="后台模式下的日志文件路径（默认 <data-dir>/server.log）")
+    parser.add_argument("--pid-file",
+                        help="后台模式下的 PID 文件路径（默认 <data-dir>/server.pid）")
     return parser.parse_args(argv)
 
 

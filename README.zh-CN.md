@@ -205,6 +205,92 @@ A: 不是。所有敏感信息都以 **SHA-256 + 随机盐** 哈希后存入 `%U
 **Q: 输入了 5 次错误密码会怎样？**  
 A: 为防止暴力破解，连续 5 次密码错误后会**关闭设置面板**，但 U 盘后台复制功能与右上角小圆点不受影响，仍在正常运行。每次错误与触顶事件都会写入日志，需要时可再次点击三次小圆点重试。
 
+## macOS 服务器（UCopy-Server）
+
+服务器独立 Python 项目（可单文件打包），提供 HTTPS + 多用户 + Web GUI 给 UCopy 客户端上传文件 + 同步配置。源码在 `ucopy_server/`，单文件产物 `dist/UCopy-Server-macos-arm64`（仅 Apple Silicon M 系列）。
+
+### 默认数据路径
+
+| 平台 | 默认数据目录 | 说明 |
+|---|---|---|
+| macOS / Linux | `~/UCopyServer/` | 自签证书、SQLite 数据库、上传文件都在这里 |
+| Windows | `%USERPROFILE%\UCopyServer\` | 同上 |
+
+数据目录内容：
+
+| 文件 | 用途 |
+|---|---|
+| `server.json` | 监听端口、绑定地址、初始 admin 账号配置 |
+| `server.db` | SQLite：users / sessions / file_index |
+| `server.log` | `--detach` 模式下的日志输出（默认路径） |
+| `server.pid` | `--detach` 模式下的 PID 文件（默认路径） |
+| `cert.pem` / `key.pem` | 自签 HTTPS 证书（首次启动自动生成） |
+| `files/<username>/` | 该用户上传的文件（按用户名分目录） |
+
+### 命令行参数
+
+```bash
+UCopy-Server-macos-arm64 [选项]
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--port PORT` | 8443 | HTTPS 监听端口 |
+| `--bind-host HOST` | `::`（IPv6 双栈，自动接 IPv4 mapped） | 绑定地址；`0.0.0.0` 仅 IPv4；`127.0.0.1` 仅本机；具体 IPv6 如 `2409:8a1e:...` |
+| `--data-dir DIR` | `~/UCopyServer/` | 数据目录 |
+| `--detach` | — | 后台运行：fork 出子进程后父进程退出，子进程继续服务；日志写到 `<data-dir>/server.log`；可关掉启动的终端 |
+| `--stop` | — | 停止 `--detach` 的后台进程（读 `server.pid` 发 SIGTERM，5 秒后升级 SIGKILL） |
+| `--log-file PATH` | `<data-dir>/server.log` | 自定义日志文件路径 |
+| `--pid-file PATH` | `<data-dir>/server.pid` | 自定义 PID 文件路径 |
+| `--init-only` | — | 只初始化（写自签证书 + admin 密码），不启动服务 |
+| `--print-admin-password` | — | 打印当前 admin 密码到终端（密码忘了时用） |
+| `--no-autostart` | — | 不注册 macOS launchd 自启动（首次启动默认会注册） |
+
+### 后台模式（推荐用法）
+
+**启动**（后台 + 关掉终端不影响）：
+
+```bash
+./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer --detach
+# 输出：
+# [detached] PID=12345 正在后台运行；日志: /Users/you/UCopyServer/server.log
+# [detached] 停止: <exe> --data-dir /Users/you/UCopyServer --stop
+# [detached] 父进程退出，可关掉此终端
+```
+
+**关掉启动的 cmd / 终端窗口**——server 继续在后台跑。
+
+**查看日志**：
+
+```bash
+tail -f ~/UCopyServer/server.log
+```
+
+**停止**：
+
+```bash
+./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer --stop
+# 输出：
+# OK: PID 12345 已停止
+```
+
+**注意事项**：
+
+- `--detach` 模式下不会注册 macOS launchd 自启动（避免和 launchd 重复管理）
+- 重复 `--detach` 会检测到已有进程并报错（要先 `--stop`）
+- `server.pid` 文件残留但进程已死时，`--stop` 会自动清掉
+- macOS 上重启后 `--detach` 进程不会自动启动（要开机自启请用 `--install-launchd`，或在 `~/Library/LaunchAgents/com.skyc8266.ucopy-server.plist` 配 launchd）
+
+### 前台模式（开发调试用）
+
+```bash
+./UCopy-Server-macos-arm64 --data-dir ~/UCopyServer
+```
+
+- 占用当前终端，看到 `[INFO] UCopy Server 启动: https://[::]:8443` 后服务就绪
+- `Ctrl+C` 停止
+- macOS 首次启动会自动注册 launchd 自启动（除非 `--no-autostart`）
+
 ## 远程模式（v1.5.0+）
 
 UCopy 可连接到一台远程服务器，把本地拷贝到的文件自动上传上去，并在多台机器之间同步配置。
