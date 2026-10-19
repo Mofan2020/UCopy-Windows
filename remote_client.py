@@ -93,21 +93,29 @@ def normalize_server_address(server_url: str) -> str:
         2609:abcd::1       -> "https://[2609:abcd::1]"
         [2609:abcd::1]:8443-> "https://[2609:abcd::1]:8443"
         https://...        -> 原样返回（只校验格式）
-    仅接受 https。拒绝 http/ftp/空/未指定 scheme。
+        http://...         -> 原样返回（v1.7.1：明文 HTTP 模式，非 HTTPS）
+    拒绝：ftp/ws/file/空/未指定 scheme。
     """
     s = (server_url or "").strip()
     if not s:
         raise ValueError("server_url is empty")
-    if s.startswith("http://"):
-        raise ValueError("远程模式仅支持 https（明文 http 会被拒绝）")
-    if "://" in s and not s.startswith("https://"):
-        raise ValueError(f"远程模式仅支持 https（{s.split('://', 1)[0]} 协议被拒绝）")
-    # 不带 scheme：补 https://
-    if "://" not in s:
+    if "://" in s:
+        # 已带 scheme：只允许 http/https
+        scheme = s.split("://", 1)[0].lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(f"远程模式仅支持 http/https（{scheme} 协议被拒绝）")
+        if scheme == "http":
+            # v1.7.1：保留 http，UI 层负责弹安全警告。
+            # 不再做 https-only 的强制。
+            pass
+    else:
+        # 不带 scheme：补 https://
         s = "https://" + s
     # 给裸 IPv6 字面量补方括号：识别 host 含 ":" 但不在 [...] 中。
     # IPv6 字面量含 ":" 且不是 "host:port" 的纯数字端口。
     # 判定：含 "::" 或 ":" 出现 ≥2 次 → IPv6；否则视为普通 host:port。
+    # v1.7.1：保留原 scheme（http/https）。
+    scheme = s.split("://", 1)[0].lower()  # http 或 https
     after_scheme = s.split("://", 1)[1]
     if "/" in after_scheme:
         host_port = after_scheme.split("/", 1)[0]
@@ -116,15 +124,15 @@ def normalize_server_address(server_url: str) -> str:
     if host_port and not host_port.startswith("["):
         if "::" in host_port or host_port.count(":") >= 2:
             # 纯 IPv6，无 port
-            rebuilt = f"https://[{host_port}]"
+            rebuilt = f"{scheme}://[{host_port}]"
             return rebuilt.rstrip("/")
         # 普通 host:port 或 host
         if ":" in host_port:
             host_only, sep, port = host_port.rpartition(":")
             if port.isdigit():
-                rebuilt = f"https://{host_only}:{port}"
+                rebuilt = f"{scheme}://{host_only}:{port}"
             else:
-                rebuilt = f"https://{host_port}"
+                rebuilt = f"{scheme}://{host_port}"
             return rebuilt.rstrip("/")
     return s.rstrip("/")
 
@@ -309,6 +317,10 @@ class RemoteClient:
 
     def __init__(self, server_url: str, store: Optional[TrustedServerStore] = None):
         self.server_url = normalize_server_address(server_url)
+        # v1.7.1：scheme / is_http —— UI 层用来决定是否弹「明文 HTTP」警告。
+        # http:// 明文传输，不加密；UI 上要在用户首次启用 / 测试时弹安全警告。
+        self.scheme = (self.server_url.split("://", 1)[0]).lower() if "://" in self.server_url else "https"
+        self.is_http = (self.scheme == "http")
         self.store = store or TrustedServerStore()
         self._jar = http.cookiejar.CookieJar()
         self._opener = None  # lazy init
@@ -320,12 +332,20 @@ class RemoteClient:
 
     # ---------- low-level request ----------
     def _build_opener(self):
-        # 流程：
-        #   - 如果 store 里已存 fingerprint → 用 CERT_NONE + 后续 pin 校验
-        #     （自签 CA 不认，所以要绕开 CA 校验）
-        #   - 如果没存 → 用 CERT_REQUIRED（标准 CA 校验），自签会抛
-        #     SSLCertVerificationError，UI 层捕获后让用户"信任"，调 store.trust，
-        #     然后**重新 new client**（下次进"已信任"分支）
+        # 流程（v1.7.1：按 scheme 分支）：
+        #   - HTTP 模式：走 urllib HTTPHandler（明文）；不校验证书、不绑定指纹。
+        #     适用场景：用户在安全内网、自托管服务器禁用了 TLS（v1.7.0 服务端有
+        #     --disable-https 开关）。
+        #   - HTTPS 模式：
+        #       - 如果 store 里已存 fingerprint → 用 CERT_NONE + 后续 pin 校验
+        #         （自签 CA 不认，所以要绕开 CA 校验）
+        #       - 如果没存 → 用 CERT_REQUIRED（标准 CA 校验），自签会抛
+        #         SSLCertVerificationError，UI 层捕获后让用户"信任"，调 store.trust，
+        #         然后**重新 new client**（下次进"已信任"分支）
+        if self.is_http:
+            return urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(self._jar),
+            )
         if self.store.get_fingerprint(self.server_url):
             trust_unknown_peer = True
         else:

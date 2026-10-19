@@ -236,7 +236,11 @@ def save_config(cfg):
 # ---------- v1.6.0: API key 加密存储（DPAPI / Keychain / machine-bound） ----------
 
 def _default_client_id() -> str:
-    """默认客户端标识：机器名 + 短随机后缀（保证同机多名进程不冲突）。"""
+    """默认客户端标识：机器名 + 短随机后缀。
+
+    v1.7.1：固定加 6 位 hex 随机后缀，避免同 hostname 的多台机器（或同名机器
+    互踢时）撞 client_id 抢占独占锁。后缀以 "-" 与主机名分隔，仍然人眼可读。
+    """
     try:
         import socket as _s
         host = (_s.gethostname() or "ucopy").strip() or "ucopy"
@@ -244,7 +248,10 @@ def _default_client_id() -> str:
         host = "ucopy"
     # 取 hostname 前 40 字符，去掉非法字符
     safe = "".join(ch for ch in host if ch.isalnum() or ch in "-_.")
-    return (safe or "ucopy")[:64]
+    safe = (safe or "ucopy")[:40]
+    suffix = secrets.token_hex(3)  # 6 hex chars
+    cid = f"{safe}-{suffix}"
+    return cid[:64]
 
 
 def _remote_key_account(cfg) -> str:
@@ -300,6 +307,142 @@ def clear_remote_key(cfg) -> None:
         rem.pop("api_key_enc", None)
     except Exception:
         pass
+
+
+# ---------- v1.7.1: HTTP 明文模式安全警告 ----------
+# 设计：用户用 http:// 服务器时（仅内网自托管场景），首次启用/测试连接要
+# 弹「明文传输」警告。含「不再提示此服务器」勾选，勾选后存到独立记忆文件。
+# 记忆文件按 server_url 维度，与 TrustedServerStore 无关 —— https 模式不写入。
+HTTP_WARNING_FILE = os.path.join(os.path.expanduser("~"),
+                                  ".ucopy_http_acknowledged.json")
+
+
+def _load_http_warning_acks() -> dict:
+    """读取 HTTP 警告已确认列表（{server_url: True}）。损坏文件返回空 dict。"""
+    try:
+        if os.path.exists(HTTP_WARNING_FILE):
+            with open(HTTP_WARNING_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_http_warning_acks(data: dict) -> None:
+    """写 HTTP 警告记忆文件（原子写：tmp + os.replace）。"""
+    try:
+        tmp = HTTP_WARNING_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, HTTP_WARNING_FILE)
+    except Exception:
+        # 写失败 → 静默；下次再问用户（不要 raise 让弹窗路径崩）
+        pass
+
+
+def has_http_warning_ack(server_url: str) -> bool:
+    """该 server_url 是否已被用户确认过 HTTP 明文警告？"""
+    if not server_url:
+        return False
+    try:
+        from remote_client import normalize_server_address
+        key = normalize_server_address(server_url).lower()
+    except Exception:
+        key = (server_url or "").strip().lower()
+    return bool(_load_http_warning_acks().get(key))
+
+
+def acknowledge_http_insecure(server_url: str) -> None:
+    """把 server_url 写入已确认列表。"""
+    if not server_url:
+        return
+    try:
+        from remote_client import normalize_server_address
+        key = normalize_server_address(server_url).lower()
+    except Exception:
+        key = (server_url or "").strip().lower()
+    data = _load_http_warning_acks()
+    data[key] = True
+    _save_http_warning_acks(data)
+
+
+def _http_insecure_warning(parent, server_url: str) -> bool:
+    """弹「HTTP 明文传输」安全警告（v1.7.1）。
+
+    返回 True = 用户确认继续；False = 用户取消。
+    仅在用户主动进入设置面板、点「测试连接」或勾选「启用远程模式」时调用。
+    已确认过的 server_url 不重复弹（has_http_warning_ack 为 True 时直接返回 True）。
+
+    「不再提示此服务器」勾选后调 acknowledge_http_insecure(url) 持久化记忆。
+    """
+    if not server_url:
+        return False
+    if has_http_warning_ack(server_url):
+        return True
+    # 主动弹警告：使用 askyesno + 自定义 checkbox 不可行（Tk 原生没有
+    # 「带 checkbox 的 askyesno」），所以用 Toplevel 自定义弹窗。
+    win = tk.Toplevel(parent)
+    win.title("HTTP 明文传输警告")
+    win.transient(parent)
+    win.resizable(False, False)
+    win.protocol("WM_DELETE_WINDOW", lambda: win.destroy())
+    result = {"ok": False, "dont_ask": False}
+
+    ttk.Label(win, text="服务器使用 HTTP 明文传输", font=("Helvetica", 11, "bold"),
+              foreground="#b00020").grid(row=0, column=0, columnspan=2,
+                                          padx=15, pady=(15, 5), sticky="w")
+    ttk.Label(win,
+              text=(
+                  "目标服务器地址：\n"
+                  f"  {server_url}\n\n"
+                  "HTTP 模式下：\n"
+                  "  • 数据在网络上以明文传输，可能被中间人窃听/篡改\n"
+                  "  • API Key、文件内容、密码哈希都会被截获\n"
+                  "  • 仅推荐在内网/完全可控的环境中使用\n\n"
+                  "确定要继续吗？"),
+              justify="left", wraplength=380).grid(
+        row=1, column=0, columnspan=2, padx=15, pady=5, sticky="w")
+
+    dont_ask_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(win, text="不再提示此服务器",
+                    variable=dont_ask_var).grid(
+        row=2, column=0, columnspan=2, padx=15, pady=(5, 10), sticky="w")
+
+    btns = ttk.Frame(win)
+    btns.grid(row=3, column=0, columnspan=2, pady=(0, 15))
+
+    def _ok():
+        result["ok"] = True
+        result["dont_ask"] = bool(dont_ask_var.get())
+        win.destroy()
+
+    def _cancel():
+        result["ok"] = False
+        result["dont_ask"] = False
+        win.destroy()
+
+    ttk.Button(btns, text="继续（明文传输）", command=_ok).pack(
+        side="left", padx=8)
+    ttk.Button(btns, text="取消", command=_cancel).pack(side="left", padx=8)
+
+    try:
+        win.attributes("-topmost", True)
+    except Exception:
+        pass
+    try:
+        win.grab_set()
+        parent.wait_window(win)
+    except Exception:
+        pass
+
+    if result["ok"] and result["dont_ask"]:
+        acknowledge_http_insecure(server_url)
+    return result["ok"]
+
 
 def set_auto_start(enable):
     key = win32api.RegOpenKey(
@@ -1902,56 +2045,138 @@ class RemoteConsentWindow:
 
 # ---------- 设置窗口 ----------
 class SettingsWindow:
+    # v1.7.1：自适应布局（外层 Canvas + 内部 frame + 垂直 scrollbar；窗口可调尺寸）
+    MIN_WIDTH = 480
+    MIN_HEIGHT = 420
+
     def __init__(self, master, app, on_close=None):
         self.app = app
         self.on_close_cb = on_close
         self.win = tk.Toplevel(master)
         self.win.title("UCopy 设置")
-        self.win.resizable(False, False)
+        # v1.7.1：允许拖拽改变尺寸（高 DPI / 小屏用户能调出完整 UI）
+        self.win.resizable(True, True)
+        self.win.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
         self.win.protocol("WM_DELETE_WINDOW", self.on_close)
         app.panel_win = self.win
 
         cfg = app.config
 
+        # v1.7.1：外层结构 —— Canvas + vertical scrollbar + 内嵌 Frame，
+        # 内容超出窗口高度时滚动显示（避免小屏上底部按钮看不到）。
+        # Canvas 自身用 grid 占满窗口，columnconfigure 让 scrollbar 跟随拉伸。
+        self._outer_canvas = tk.Canvas(self.win, highlightthickness=0, bd=0)
+        self._outer_scroll = ttk.Scrollbar(
+            self.win, orient="vertical", command=self._outer_canvas.yview)
+        self._outer_canvas.configure(yscrollcommand=self._outer_scroll.set)
+        self._outer_canvas.grid(row=0, column=0, sticky="nsew")
+        self._outer_scroll.grid(row=0, column=1, sticky="ns")
+        # 让 canvas 跟随窗口大小变化
+        self.win.columnconfigure(0, weight=1)
+        self.win.rowconfigure(0, weight=1)
+
+        self._scroll_frame = ttk.Frame(self._outer_canvas)
+        # window id 留着用于重新计算 scrollregion
+        self._scroll_window = self._outer_canvas.create_window(
+            (0, 0), window=self._scroll_frame, anchor="nw")
+
+        # 内容超长时让 scrollregion 自动撑大
+        def _on_inner_config(event):
+            try:
+                self._outer_canvas.configure(
+                    scrollregion=self._outer_canvas.bbox("all"))
+            except Exception:
+                pass
+        self._scroll_frame.bind("<Configure>", _on_inner_config, add="+")
+
+        # canvas 大小变化时让内部 frame 同步宽
+        def _on_canvas_config(event):
+            try:
+                self._outer_canvas.itemconfigure(
+                    self._scroll_window, width=event.width)
+            except Exception:
+                pass
+        self._outer_canvas.bind("<Configure>", _on_canvas_config, add="+")
+
+        # 鼠标滚轮（仅当 canvas 有焦点时）
+        def _on_wheel(event):
+            try:
+                if self._outer_canvas.winfo_height() < (
+                        self._scroll_frame.winfo_height()):
+                    self._outer_canvas.yview_scroll(
+                        int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+        self._outer_canvas.bind("<Enter>",
+                                lambda e: self._outer_canvas.bind_all(
+                                    "<MouseWheel>", _on_wheel))
+        self._outer_canvas.bind("<Leave>",
+                                lambda e: self._outer_canvas.unbind_all(
+                                    "<MouseWheel>"))
+
+        # 真正承载子模块的 parent（从此处开始所有 grid 都进 _scroll_frame）
+        parent = self._scroll_frame
+        # 列权重：column 1（输入框）跟随窗口拉伸
+        parent.columnconfigure(1, weight=1)
+
         # 基本设置
-        frame_basic = ttk.LabelFrame(self.win, text="基本设置", padding=5)
+        frame_basic = ttk.LabelFrame(parent, text="基本设置", padding=5)
         frame_basic.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        frame_basic.columnconfigure(1, weight=1)
 
         ttk.Label(frame_basic, text="目标目录 (必填):").grid(row=0, column=0, sticky="w", padx=5, pady=2)
         self.target_var = tk.StringVar(value=cfg["target_folder"])
-        ttk.Entry(frame_basic, textvariable=self.target_var, width=45).grid(row=0, column=1, padx=5, pady=2)
-        ttk.Button(frame_basic, text="浏览", command=self.browse_target).grid(row=0, column=2, padx=5)
+        ttk.Entry(frame_basic, textvariable=self.target_var).grid(
+            row=0, column=1, padx=5, pady=2, sticky="ew")
+        ttk.Button(frame_basic, text="浏览", command=self.browse_target).grid(
+            row=0, column=2, padx=5)
 
-        ttk.Label(frame_basic, text="最大文件数 (0=不限):").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(frame_basic, text="最大文件数 (0=不限):").grid(
+            row=1, column=0, sticky="w", padx=5, pady=2)
         self.max_files_var = tk.IntVar(value=cfg["max_total_files"])
-        ttk.Entry(frame_basic, textvariable=self.max_files_var, width=10).grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Entry(frame_basic, textvariable=self.max_files_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=5)
 
-        ttk.Label(frame_basic, text="最大总大小(MB) (0=不限):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(frame_basic, text="最大总大小(MB) (0=不限):").grid(
+            row=2, column=0, sticky="w", padx=5, pady=2)
         self.max_size_var = tk.IntVar(value=cfg["max_total_size_mb"])
-        ttk.Entry(frame_basic, textvariable=self.max_size_var, width=10).grid(row=2, column=1, sticky="w", padx=5)
+        ttk.Entry(frame_basic, textvariable=self.max_size_var, width=10).grid(
+            row=2, column=1, sticky="w", padx=5)
 
-        ttk.Label(frame_basic, text="跳过单文件大于(MB) (0=不限):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(frame_basic, text="跳过单文件大于(MB) (0=不限):").grid(
+            row=3, column=0, sticky="w", padx=5, pady=2)
         self.single_var = tk.IntVar(value=cfg["max_single_file_mb"])
-        ttk.Entry(frame_basic, textvariable=self.single_var, width=10).grid(row=3, column=1, sticky="w", padx=5)
+        ttk.Entry(frame_basic, textvariable=self.single_var, width=10).grid(
+            row=3, column=1, sticky="w", padx=5)
 
-        ttk.Label(frame_basic, text="目标空间不足(MB)不复制:").grid(row=4, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(frame_basic, text="目标空间不足(MB)不复制:").grid(
+            row=4, column=0, sticky="w", padx=5, pady=2)
         self.space_var = tk.IntVar(value=cfg["min_free_space_mb"])
-        ttk.Entry(frame_basic, textvariable=self.space_var, width=10).grid(row=4, column=1, sticky="w", padx=5)
+        ttk.Entry(frame_basic, textvariable=self.space_var, width=10).grid(
+            row=4, column=1, sticky="w", padx=5)
 
-        ttk.Label(frame_basic, text="扩展名 (如 .jpg,.png):").grid(row=5, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(frame_basic, text="扩展名 (如 .jpg,.png):").grid(
+            row=5, column=0, sticky="w", padx=5, pady=2)
         self.ext_var = tk.StringVar(value=cfg["extensions"])
-        ttk.Entry(frame_basic, textvariable=self.ext_var, width=20).grid(row=5, column=1, sticky="w", padx=5)
+        ttk.Entry(frame_basic, textvariable=self.ext_var, width=20).grid(
+            row=5, column=1, sticky="w", padx=5)
 
-        ttk.Label(frame_basic, text="文件名正则 (可空):").grid(row=6, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(frame_basic, text="文件名正则 (可空):").grid(
+            row=6, column=0, sticky="w", padx=5, pady=2)
         self.regex_var = tk.StringVar(value=cfg["regex_pattern"])
-        ttk.Entry(frame_basic, textvariable=self.regex_var, width=20).grid(row=6, column=1, sticky="w", padx=5)
+        ttk.Entry(frame_basic, textvariable=self.regex_var, width=20).grid(
+            row=6, column=1, sticky="w", padx=5)
 
         self.auto_var = tk.BooleanVar(value=cfg["auto_start"])
-        ttk.Checkbutton(frame_basic, text="开机自动启动", variable=self.auto_var).grid(row=7, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+        ttk.Checkbutton(frame_basic, text="开机自动启动",
+                        variable=self.auto_var).grid(
+            row=7, column=0, columnspan=2, sticky="w", padx=5, pady=5)
 
         # ---- 名单模式（黑名单 / 白名单，二选一）----
-        frame_list = ttk.LabelFrame(self.win, text="U盘名单", padding=5)
+        frame_list = ttk.LabelFrame(parent, text="U盘名单", padding=5)
         frame_list.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
+        frame_list.columnconfigure(0, weight=1)
+        frame_list.rowconfigure(1, weight=1)
 
         self.list_mode_var = tk.StringVar(
             value=normalize_list_mode(cfg.get("device_list_mode"))
@@ -1964,13 +2189,18 @@ class SettingsWindow:
         self.mode_combo.grid(row=0, column=1, sticky="w", padx=5, pady=2)
         self.mode_combo.bind("<<ComboboxSelected>>", self.on_mode_changed)
         self.mode_hint_var = tk.StringVar()
-        ttk.Label(frame_list, textvariable=self.mode_hint_var, foreground="gray").grid(
-            row=0, column=2, sticky="w", padx=8
-        )
+        ttk.Label(frame_list, textvariable=self.mode_hint_var,
+                  foreground="gray").grid(
+            row=0, column=2, sticky="w", padx=8)
 
-        self.device_listbox = tk.Listbox(frame_list, width=60, height=6, selectmode=tk.MULTIPLE)
-        self.device_listbox.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
-        scrollbar = ttk.Scrollbar(frame_list, orient=tk.VERTICAL, command=self.device_listbox.yview)
+        # Listbox 拉伸：跟随窗口宽度
+        self.device_listbox = tk.Listbox(
+            frame_list, height=6, selectmode=tk.MULTIPLE,
+            highlightthickness=1)
+        self.device_listbox.grid(row=1, column=0, columnspan=3, padx=5, pady=5,
+                                 sticky="nsew")
+        scrollbar = ttk.Scrollbar(frame_list, orient=tk.VERTICAL,
+                                  command=self.device_listbox.yview)
         scrollbar.grid(row=1, column=3, sticky="ns", padx=(0, 5))
         self.device_listbox.config(yscrollcommand=scrollbar.set)
 
@@ -1982,14 +2212,15 @@ class SettingsWindow:
         self.on_mode_changed()   # 初始化按钮文字与提示
 
         # ---- 远程模式 ----
-        frame_remote = ttk.LabelFrame(self.win, text="远程模式（v1.5.0+）",
+        frame_remote = ttk.LabelFrame(parent, text="远程模式（v1.5.0+）",
                                        padding=5)
         frame_remote.grid(row=2, column=0, columnspan=2, padx=5, pady=5,
                           sticky="nsew")
+        frame_remote.columnconfigure(1, weight=1)
         self._build_remote_frame(frame_remote)
 
         # 底部按钮
-        btn_frame = ttk.Frame(self.win)
+        btn_frame = ttk.Frame(parent)
         btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
         ttk.Button(btn_frame, text="保存并隐藏", command=self.save_and_hide).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="修改密码", command=self.change_password).pack(side=tk.LEFT, padx=5)
@@ -1999,23 +2230,30 @@ class SettingsWindow:
         self.win.grab_set()
 
     def _build_remote_frame(self, parent):
-        """构造远程模式子面板（v1.6.0：API key 认证）。"""
+        """构造远程模式子面板（v1.6.0：API key 认证 + v1.7.1：自适应）。"""
         cfg_remote = (self.app.config.get("remote") or {})
+        # v1.7.1：列权重已经在 SettingsWindow 设过（column 1 weight=1），
+        # 这里给 frame 列再设一次，让远程面板内部也能横向拉伸。
+        try:
+            parent.columnconfigure(1, weight=1)
+            parent.columnconfigure(2, weight=1)
+        except Exception:
+            pass
         # 服务器地址
         ttk.Label(parent, text="服务器地址 (https://host:8443):").grid(
             row=0, column=0, sticky="w", padx=5, pady=2)
         self.remote_url_var = tk.StringVar(value=cfg_remote.get("server_url", ""))
-        ttk.Entry(parent, textvariable=self.remote_url_var, width=42).grid(
-            row=0, column=1, columnspan=2, padx=5, pady=2, sticky="w")
+        ttk.Entry(parent, textvariable=self.remote_url_var).grid(
+            row=0, column=1, columnspan=2, padx=5, pady=2, sticky="ew")
 
         # API Key（v1.6.0：替代用户名/密码）
         ttk.Label(parent, text="API Key:").grid(row=1, column=0, sticky="w",
                                                padx=5, pady=2)
         self.remote_key_var = tk.StringVar()
         self.remote_key_entry = ttk.Entry(parent, textvariable=self.remote_key_var,
-                                         show="*", width=42)
+                                         show="*")
         self.remote_key_entry.grid(row=1, column=1, columnspan=2, padx=5, pady=2,
-                                   sticky="w")
+                                   sticky="ew")
         saved_key_state = "已保存" if cfg_remote.get("api_key_enc") else "未设置"
         ttk.Label(parent, text=f"（{saved_key_state}；留空则用已保存的 key）",
                   foreground="#666", font=("Helvetica", 9)).grid(
@@ -2024,12 +2262,13 @@ class SettingsWindow:
         # 客户端名称（显示在服务器 Web GUI 的"使用中"状态里）
         ttk.Label(parent, text="本机名称:").grid(row=3, column=0, sticky="w",
                                                padx=5, pady=2)
-        import socket as _sock
-        default_client_name = cfg_remote.get("client_name") or _sock.gethostname() or "UCopy"
+        # v1.7.1：默认值带 6 位随机后缀，避免同 hostname 的多台机器互踢独占锁
+        default_client_name = (cfg_remote.get("client_name")
+                               or _default_client_id())
         self.remote_client_name_var = tk.StringVar(value=default_client_name)
         ttk.Entry(parent, textvariable=self.remote_client_name_var, width=30).grid(
-            row=3, column=1, padx=5, pady=2, sticky="w")
-        ttk.Label(parent, text="（仅用于在服务器上区分设备）",
+            row=3, column=1, padx=5, pady=2, sticky="ew")
+        ttk.Label(parent, text="（便于在服务器上区分设备）",
                   foreground="#666", font=("Helvetica", 9)).grid(
             row=3, column=2, sticky="w")
 
@@ -2049,12 +2288,25 @@ class SettingsWindow:
             row=5, column=0, sticky="w", padx=5, pady=2)
         ttk.Label(parent, textvariable=self.remote_fp_var, foreground="#555",
                   font=("Courier", 9)).grid(
-            row=5, column=1, columnspan=2, sticky="w", padx=5, pady=2)
+            row=5, column=1, columnspan=2, sticky="ew", padx=5, pady=2)
 
         self.remote_status_var = tk.StringVar(value=self._status_text())
-        ttk.Label(parent, textvariable=self.remote_status_var, foreground="#333",
-                  wraplength=380, justify="left").grid(
-            row=6, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+        # v1.7.1：wraplength 不再写死，跟随窗口宽度；用 width 字段失效就
+        # 用 winfo_width 跟随。
+        self.remote_status_label = ttk.Label(parent, textvariable=self.remote_status_var,
+                                             foreground="#333",
+                                             justify="left", anchor="w")
+        self.remote_status_label.grid(
+            row=6, column=0, columnspan=3, sticky="ew", padx=5, pady=2)
+        # 跟随 canvas/frame 宽度调整 wraplength
+        def _adjust_status_wrap(event=None):
+            try:
+                w = parent.winfo_width()
+                if w > 50:
+                    self.remote_status_label.configure(wraplength=max(200, w - 40))
+            except Exception:
+                pass
+        parent.bind("<Configure>", _adjust_status_wrap, add="+")
 
         # 操作按钮
         btn_row = ttk.Frame(parent)
@@ -2090,7 +2342,11 @@ class SettingsWindow:
         self.remote_status_var.set(self._status_text())
 
     def _persist_remote(self, enabled_now: bool):
-        """把 UI 的 remote 段写回 cfg + 同步到 RemoteUploader，启用时弹强制确认。"""
+        """把 UI 的 remote 段写回 cfg + 同步到 RemoteUploader，启用时弹强制确认。
+
+        v1.7.1：启用路径在 RemoteConsentWindow 之前先检查 HTTP 明文警告，
+        用户取消 → 整个启用流程取消（与「未勾合法用途三项」同一处理）。
+        """
         new_enabled = bool(self.remote_enabled_var.get())
         # 关闭路径：不弹确认，直接关
         if not new_enabled:
@@ -2137,6 +2393,14 @@ class SettingsWindow:
                 "复制生成的 key 粘贴到这里。",
                 parent=self.win)
             return False
+        # v1.7.1：HTTP 明文模式警告（在 RemoteConsentWindow 之前）。
+        # 仅当 url 以 http:// 开头才弹；https 与无 scheme 都不弹（无 scheme
+        # 默认按 https 处理）。
+        if url.lower().startswith("http://"):
+            if not _http_insecure_warning(self.win, url):
+                # 用户取消 → 关闭启用 checkbox
+                self.remote_enabled_var.set(False)
+                return False
         # 强制确认（保留三项：合法用途 / 未受骗 / 服务器地址正确）
         if not RemoteConsentWindow(self.win, url).show():
             # 用户取消
@@ -2203,6 +2467,10 @@ class SettingsWindow:
             messagebox.showerror("错误", "remote_client 模块不可用",
                                  parent=self.win)
             return
+        # v1.7.1：HTTP 明文模式警告（首次）
+        if url.lower().startswith("http://"):
+            if not _http_insecure_warning(self.win, url):
+                return
         # 第一次自签 cert 会抛 SSLCertVerificationError；先做一次「探测」拿 fingerprint
         try:
             client = remote_client.RemoteClient(url)

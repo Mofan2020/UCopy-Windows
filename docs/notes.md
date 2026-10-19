@@ -1,5 +1,79 @@
 # UCopy 开发笔记
 
+## v1.7.1 — 自适应 UI + HTTP 明文模式警告 + 多客户端识别
+
+### 改动概述
+
+#### 1. 设置窗口自适应（小屏 / 高 DPI 完整显示）
+
+- **症状**：v1.7.0 之前的 SettingsWindow 固定尺寸 (`resizable(False, False)`)、固定列宽
+  (`Entry(width=45)` / `Listbox(width=60)` / `wraplength=380`)，在低分辨率（1024×768）
+  或 Windows DPI 缩放（150% / 200%）下，内容超出窗口右边界或底部被截断。
+- **修法**（`ucopy.py::SettingsWindow`）：
+  - 外层 `Canvas + vertical Scrollbar`，内容超长时滚动显示
+  - `self.win.resizable(True, True)` + `self.win.minsize(480, 420)` —— 可拖拽、最小尺寸
+  - 列权重 `columnconfigure(1, weight=1)`，`Entry` 用 `sticky="ew"` —— 横向拉伸
+  - 远程状态 Label 用 `bind("<Configure>")` 跟随窗口宽度调整 `wraplength`
+  - 鼠标滚轮在 canvas 上自动滚动（仅内容超出时生效）
+- **不动的边界**：`FloatingDot` / `LoginWindow` / `RemoteConsentWindow` 等其它窗口不动
+  （用户没有反馈，且它们尺寸本身就小）
+
+#### 2. HTTP 明文模式安全警告
+
+- **场景**：v1.7.0 服务端新增 `--disable-https`（CLI + Web GUI 开关），让用户在内网
+  部署时可以走明文 HTTP。客户端之前 **强制 https** —— 用户改服务端 HTTP 后，客户端
+  一填 URL 就抛 `ValueError("远程模式仅支持 https")`，连不上。
+- **设计选择**：用户原话「支持 http 服务器，但是弹出一个安全性警告，不完全阻止用户
+  使用 http 服务器」。落地形态：
+  - `normalize_server_address` 接受 `http://`（其它非法协议仍拒绝：ftp/ws/file）
+  - `RemoteClient.scheme` / `is_http` 属性，UI 层用 `is_http` 决定是否弹警告
+  - `_build_opener`：HTTP 走 urllib HTTPHandler（明文，不做证书校验）；HTTPS 走原
+    fingerprint pin 路径
+  - `_http_insecure_warning(parent, url)`：首次启用 / 测试连接时弹模态警告，含「不再
+    提示此服务器」checkbox。已确认过的 URL 不重复弹。
+  - 记忆文件：`~/.ucopy_http_acknowledged.json`，按 server_url 维度持久化（与
+    `~/.ucopy_trusted_servers.json` 独立，互不影响）
+  - 启用路径检查顺序：HTTP 警告 → RemoteConsentWindow 三项 → 写 cfg
+- **不动的边界**：服务端没改 —— 用户保留启用 HTTP 的能力，客户端不强制 HTTPS 但要警告
+
+#### 3. 多客户端 / 多 U 盘识别
+
+- **场景**：v1.6.0 引入 `client_id = hostname`，服务器端用 client_id 做独占锁。但同
+  hostname 的多台机器（如两台都叫 "DESKTOP-ABC123" 的机器）会互踢独占锁。
+- **修法**（`ucopy.py::_default_client_id`）：
+  - 默认值改为 `{hostname}-{6hex random}`，每次启动随机后缀不同
+  - `SettingsWindow._build_remote_frame` 默认值改用 `_default_client_id()`
+  - 已保存到 cfg 的 `client_name` 不变（用户主动改的保留）
+- **多 U 盘区分**：`get_drive_info` 已有 GUID 优先 + serial+label fallback，不变。
+  已覆盖 FAT32 / exFAT / NTFS 各文件系统唯一标识。
+- **不动的边界**：`client_id` 没扩展成「每进程 / 每用户独立」——服务器端独占锁的语义
+  不变（同 key 同时只服务一个 client_id）。
+
+### 兼容性
+
+- 旧配置（`client_name` 仍是 hostname）继续工作：默认值用 `_default_client_id()`，
+  cfg 里有值就用 cfg 里的值，不主动覆盖用户设置
+- `~/.ucopy_http_acknowledged.json` 是新文件，不存在就当全部未确认
+- `normalize_server_address` 接受 `http://` 是行为变更：之前会抛错，现在接受
+  + UI 弹警告。已存在的 https URL 行为完全不变。
+
+### 测试覆盖（282+ 项全绿）
+
+- `.selftest.py` 第 12 节远程模式测试扩充：
+  - `normalize_server_address` 接受 http 多种格式（含 IPv6）
+  - `normalize_server_address` 拒绝 ftp/ws/空
+  - `RemoteClient.scheme / is_http` 属性正确
+  - `TrustedServerStore` 与 HTTP 警告记忆文件独立持久化
+  - `SettingsWindow` 源码层断言（`resizable(True, True)` / `minsize` /
+    `columnconfigure` / `sticky="ew"` / 外层 Canvas + Scrollbar）
+  - `_default_client_id` 两次调用结果不同（带随机后缀）
+- `device_indicator.py --selftest` 48/48 项不受影响
+
+### 关键 commit hash
+
+（commit 后填回）
+
+
 ## v1.4.3 — 隐私检测扩 GUID + 多策略打开 + WASAPI 麦克风
 
 ### 背景：v1.4.2 为什么没修好
