@@ -71,7 +71,7 @@
 
 ### 关键 commit hash
 
-（commit 后填回）
+- `03ed968` — feat(v1.7.1): 设置窗口自适应 + HTTP 明文模式警告 + 多客户端识别
 
 
 ## v1.4.3 — 隐私检测扩 GUID + 多策略打开 + WASAPI 麦克风
