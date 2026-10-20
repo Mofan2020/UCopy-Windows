@@ -1,58 +1,97 @@
 # UCopy 开发笔记
 
-## v1.7.3 — server 端 db handle watchdog（防御性 fix）
+## v1.7.4 — 现状记录 + 临时恢复工具（不声称修复）
+
+### 事实（2026-10-20 22:30 ~ 23:50 复盘）
+
+v1.7.3 加了 db handle watchdog 想"自动修"long-running server 出现的"server 内存有 key
+但磁盘 db 文件里没记录"问题。**这次复盘证明 v1.7.3 没修这个问题**：
+
+- 22:32:27 重启 server（v1.7.3 binary + watchdog 线程），login/POST /keys 立刻 200
+- 22:35:21 admin 创建 key #3 REGRESSION_FINAL，server 返回 200，
+  GET /api/v1/keys 也能看到 3 个
+- 22:35:21 同一时刻，`sqlite3 server.db "SELECT * FROM api_keys"` 只看到 2 个（id=1, 2）
+- lsof 显示 server 进程持有 **6 个指向不同 inode 的 server.db-wal 句柄**，
+  其中 4 个已经 unlinked 但 fd 没释放
+- 22:35:27 watchdog 抛 `OperationalError: disk I/O error`（捕获到未处理）
+
+**结论**：v1.7.3 的 watchdog 捕获到了事故，但**当前设计无法自动恢复**——
+SIGTERM 后 ThreadingHTTPServer.shutdown() 在主线程阻塞，daemon 线程不
+真退出，server 还是不释放 fd，重启还是不会真发生。
+
+### 真正暴露的事实
+- long-running server 进磁盘 db 写入断流的 bug **仍在**
+- 重启只是临时恢复手段，每次重启后大约 1-3 分钟内 bug 再现
+- root cause 仍 100% 未确诊（高度怀疑 macOS APFS + PyInstaller onefile 抽 _MEI
+  目录的 sqlite3 dylib + 长 fd 持有 的某些交互）
+- v1.7.3 release assets 已经在用户手里，但 v1.7.3 binary 的"defensive fix"
+  实际只在 server.log 里多了一段早期 warning，**没真正恢复持久化**
+
+### 改动概述
+1. **`docs/notes.md`**：明确 v1.7.3 = "早期检测器，未修问题"
+2. **`restart-server.sh`**：临时恢复工具（不依赖 launchd 服务）——
+   - 检测 server 进程是否在跑、能否响应 API
+   - 如果 db 写入不可见（OperationalError），自动 `kill -TERM` 优雅停，
+     等 10s → `kill -9`
+   - 重新 launch detach 的 server
+   - 在 `dist/UCopy-Server-macos-arm64` + `~/UCopyServer/` 路径假设下可用
+3. **加 selftest 覆盖**：检查 restart 工具至少能 dry-run 通过检查。
+4. **回退 v1.7.3 的 db.py 注释修改**：发现 v1.7.3 之前的 db.py 注释也合理
+
+### 不动的边界
+- **v1.7.3 binary 不撤回**：release 已经被下载；但 release notes 标成
+  "experiment / early-detector"，commit aaae8ea 不变
+- **不动 server.py / db.py**：任何"重启后 +1 分钟又能用"的 server 代码
+  改动都是猜测性 fix，未在确诊 root cause 之前引入
+- **不动 launchd plist**：launchd 服务在 v1.7.3 binary 路径之前，用户决定是否替换
+
+### 当前可用状态（2026-10-20 22:48）
+- production server (pid 85243) 在跑，监听 127.0.0.1:8443 (`--disable-https --detach`)
+- 当前 GET /api/v1/ping = 200 + login 200 + GET keys 200
+- bug 已再次发作：server 内存 3 keys，磁盘 db 实际只有 2 行
+- 用户需在使用过程中观察；如再发生 disk I/O error，按 `restart-server.sh`
+  临时恢复
+
+### 关键 commit hash
+- `1f8633a` — docs+tool(v1.7.4): restart-server.sh 自动检测+重启 + 复盘诚实声明
+
+## v1.7.3 — server 端 db handle watchdog（**未修问题，仅早期检测器**）
 
 ### 症状
 - 2026-10-20 用户报告：服务器长时间跑后，「创建 token」返回 200，
   GET /api/v1/keys 也能看到，但 **SQLite 数据库里没有这条记录**。
-  重启 server 后写入恢复正常。
+  重启 server 后写入能恢复一段时间（约 1-3 分钟），但 bug 会再次发生。
 
 ### 排查关键观察
-- GET /api/v1/keys（server 内存）= 6 条
+- GET /api/v1/keys（server 内存）= N 条
 - 直接 `sqlite3 server.db "SELECT * FROM api_keys"` = 0 条
-- 服务器进程的 fd 显示打开了 db + WAL（lsof 看到 61440 + 148352 字节）
+- 服务器进程的 fd 显示打开了 db + WAL（lsof 看到几 MB 的 WAL）
 - 但 OS 层 ls -la 看 server.db-wal = 0 字节
-- server.db mtime 永不更新（最后一次写入是 10-17 19:42，10-20 启动后没改过）
-- `kill -9` 后进程退出 → db 还是 0 行（说明 server 进程的写入从未刷到磁盘）
+- server.db mtime 间歇性更新，重启后 1-3 分钟内 mtime 不再前进
+- lsof 显示 server 持有多个指向不同 inode 的 server.db-wal 句柄，
+  部分 inode 已被 unlink 但 fd 未释放
+- 同 db 文件外部 sqlite3 RO 读 OK；server 进程自己读 OperationalError
 
-### 根因（未确诊）
-**最可能假设**：某些 long-running server 进程中，server 进程的 db handle / WAL fd
-跟磁盘 db 文件脱钩（macOS 上 detach + 长 fd 持有场景，或 launchd + 同时存在多个
-server instance，例如旧 daemon 与新 detach server 并存）。
+### 根因（仍未确诊）
+**最可能假设**：macOS APFS + PyInstaller onefile 抽 _MEI 目录的 sqlite3 dylib
++ 长 fd 持有，在某些时序下 server 进程的 sqlite3 handle 跟磁盘 db 脱钩。
 
-无法 100% 复现；只能在生产环境 kill -9 重启后观察到"恢复"。
+代码层未发现 bug —— 隔离环境（同步 sqlite3）行为正常，问题只在 PyInstaller
+打包的 server 内部长跑后出现。
 
-### 改动概述
-1. **`server.py::run()` 内启动 db handle watchdog 线程（v1.7.3）**：
-   - 启动后 30s 一次，用独立 RW sqlite3 连接 + 独立 RO 进程测试
-     "server 写的 marker → 其他进程能不能立刻读到"。
-   - 用临时表 `__ucopy_watchdog (ts TEXT PRIMARY KEY)` 存 marker，
-     INSERT → 独立 RO 连接 SELECT → DELETE，全过程 ≈1ms 完成。
-   - 连续 3 次失败（每次相隔 30s）→ 发 SIGTERM 给当前进程，
-     ThreadingHTTPServer.shutdown()，让 launchd 能自动重启恢复。
-   - 该线程以 daemon=True 启动，SIGTERM/SIGINT 时 stop_event.set() 立即终止。
-2. **`db.py::open_db()` 注释更新**：移除 v1.7.2 PRAGMA busy_timeout 实验性改动
-   （未验证有效），保留写盘路径的注释。
-3. **PyInstaller binary 重新打包** `dist/UCopy-Server-macos-arm64`。
+### 改动概述（实事求是的版本）
+1. **加了 db handle watchdog**：30s 一次，独立连接测一次"写可见性"。
+   失败时写 WARNING 日志 + 连续 3 次发 SIGTERM（**无法在生产环境优雅退出**，
+   见 v1.7.4 复盘）。
+2. 重打包 server binary
 
 ### 不动的边界
-- launchd plist 不改（用户旧 launchd 服务仍是 v1.7.0 binary 路径；新 binary
-  要走 launchd 时需 `launchctl unload && launchctl load`，用户决定时机）。
-- `db.py::open_db()` 保持原 PRAGMA 设置不变（不开 synchronous=FULL，
-  不引 busy_timeout —— 这些都是猜测性 fix，不在确诊范围）。
+- launchd plist 不改：v1.7.3 binary 没真正解决问题，重启仍可能再次发作
+- db.py 没改：未确诊 root cause 之前任何 PRAGMA 调整都是猜测
 
-### 验证
-- 隔离环境 (`_isolated_wd/`) 起新 binary：
-  - GET /ping 200
-  - POST /api/v1/keys → 200，server memory 写入
-  - 独立 sqlite3 RO 读 api_keys → 6 行（一致）
-  - 35s 后 `__ucopy_watchdog` 表存在（说明 watchdog CREATE TABLE 至少跑过一次）
-- 生产 server (pid 79612) 起 v1.7.3 binary，POST /keys 写入正常。
-
-### 已知风险
-- watchdog 是"事故早期检测器"：定位下次事故，不是确诊级 fix。
-- 如果根因是 launchd + detach 并存，仅重启 server 不够 —— 还会复发。
-  长期 fix 是统一所有进程的启动方式，但本研究不触及。
+### 验证（实事求是的版本）
+- 隔离环境（短跑 5 分钟）写入正常
+- **生产 server 重启后 1-3 分钟内** bug 仍会复发（见 v1.7.4）
 
 ### 关键 commit hash
 - `aaae8ea` — feat(server v1.7.3): db handle watchdog +事故复盘文档
