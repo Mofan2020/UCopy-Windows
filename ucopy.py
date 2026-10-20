@@ -2471,48 +2471,55 @@ class SettingsWindow:
         if url.lower().startswith("http://"):
             if not _http_insecure_warning(self.win, url):
                 return
-        # 第一次自签 cert 会抛 SSLCertVerificationError；先做一次「探测」拿 fingerprint
-        try:
-            client = remote_client.RemoteClient(url)
-            fp = client.get_current_fingerprint()
-        except Exception as e:
-            messagebox.showerror("连接失败", str(e), parent=self.win)
-            return
-        if not fp:
-            messagebox.showerror("连接失败", "无法获取服务器证书指纹（地址错？HTTPS 端口错？）",
-                                 parent=self.win)
-            return
-        # 拿 store 里的已有 fingerprint
-        store = client.store
-        stored = store.get_fingerprint(url)
-        if stored is None:
-            # 未信任 → 弹窗让用户决定
-            ok = messagebox.askyesno(
-                "信任此服务器？",
-                f"服务器证书指纹（SHA-256）：\n\n{fp}\n\n"
-                f"这是自签证书（首次连接）。\n"
-                f"确认信任后该指纹会保存到 ~/.ucopy_trusted_servers.json，\n"
-                f"以后只接受这个指纹（防 MITM）。\n\n"
-                f"是否信任？",
-                parent=self.win,
-            )
-            if not ok:
+        # v1.7.2：HTTP 明文协议没证书/指纹，**跳过**整段 cert 探测与首次信任弹窗。
+        # 浏览器把 HTTPS-first 当常识，但 UCopy 不强制 TLS —— 内网用户用 HTTP 也得能
+        # 测试连接，不能被「无法获取服务器证书指纹」的报错堵住。
+        is_http_url = url.lower().startswith("http://")
+        client = remote_client.RemoteClient(url)
+        fp = None if is_http_url else client.get_current_fingerprint()
+        if not is_http_url:
+            # HTTPS 路径：第一次自签 cert 会抛 SSLCertVerificationError；先做一次
+            # 「探测」拿 fingerprint
+            try:
+                fp = client.get_current_fingerprint()
+            except Exception as e:
+                messagebox.showerror("连接失败", str(e), parent=self.win)
                 return
-            store.trust(url, fp)
-        elif stored != fp:
-            # 已有信任但 fingerprint 不一致 → 拒绝
-            messagebox.showerror(
-                "证书指纹不匹配",
-                f"当前服务器指纹与已信任的不一致：\n\n"
-                f"已信任: {stored[:32]}…\n"
-                f"现在  : {fp[:32]}…\n\n"
-                f"服务器可能换了证书，或者有人在中间人攻击。\n"
-                f"要信任新证书请先删除 ~/.ucopy_trusted_servers.json 中此 URL 的记录。",
-                parent=self.win,
-            )
-            return
-        # 信任已建立，重新 new client 让它走 CERT_NONE 路径
-        client = remote_client.RemoteClient(url, store=store)
+            if not fp:
+                messagebox.showerror("连接失败", "无法获取服务器证书指纹（地址错？HTTPS 端口错？）",
+                                     parent=self.win)
+                return
+            # 拿 store 里的已有 fingerprint
+            store = client.store
+            stored = store.get_fingerprint(url)
+            if stored is None:
+                # 未信任 → 弹窗让用户决定
+                ok = messagebox.askyesno(
+                    "信任此服务器？",
+                    f"服务器证书指纹（SHA-256）：\n\n{fp}\n\n"
+                    f"这是自签证书（首次连接）。\n"
+                    f"确认信任后该指纹会保存到 ~/.ucopy_trusted_servers.json，\n"
+                    f"以后只接受这个指纹（防 MITM）。\n\n"
+                    f"是否信任？",
+                    parent=self.win,
+                )
+                if not ok:
+                    return
+                store.trust(url, fp)
+            elif stored != fp:
+                # 已有信任但 fingerprint 不一致 → 拒绝
+                messagebox.showerror(
+                    "证书指纹不匹配",
+                    f"当前服务器指纹与已信任的不一致：\n\n"
+                    f"已信任: {stored[:32]}…\n"
+                    f"现在  : {fp[:32]}…\n\n"
+                    f"服务器可能换了证书，或者有人在中间人攻击。\n"
+                    f"要信任新证书请先删除 ~/.ucopy_trusted_servers.json 中此 URL 的记录。",
+                    parent=self.win,
+                )
+                return
+            # 信任已建立，重新 new client 让它走 CERT_NONE 路径
+            client = remote_client.RemoteClient(url, store=store)
         try:
             login_data = client.login_with_key(api_key, client_name)
             me = client.me()
@@ -2528,15 +2535,16 @@ class SettingsWindow:
                 f"配额: {me['quota_mb']} MB\n"
                 f"心跳: 每 {client.heartbeat_interval} 秒{extra}",
                 parent=self.win)
-            # 同步 UI 上的 fingerprint 显示
-            self.remote_fp_var.set(fp)
+            # 同步 UI 上的 fingerprint 显示（v1.7.2：HTTP 明文模式无指纹，写空）
+            display_fp = fp or ""
+            self.remote_fp_var.set(display_fp)
             # 写回配置
             self.app.config.setdefault("remote", {})
             self.app.config["remote"].update({
                 "server_url": url,
                 "client_name": client_name,
                 "auto_upload": bool(self.remote_auto_var.get()),
-                "trusted_fingerprint": fp,
+                "trusted_fingerprint": display_fp,
             })
             # v1.6.0：API key 加密存储
             if needs_save:

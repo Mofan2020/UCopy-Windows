@@ -1,5 +1,38 @@
 # UCopy 开发笔记
 
+## v1.7.2 — 远程模式 HTTP 协议适配（fingerprint 探测跳过）
+
+### 症状
+- v1.7.1 引入 HTTP 明文模式后，**客户端「测试连接」仍然报错「无法获取服务器
+  指纹（地址错？HTTPS 端口错？）」**，虽然服务器 HTTP 端是通的
+  （curl / 浏览器 200 OK）。这是因为 `test_remote` 调用了
+  `RemoteClient.get_current_fingerprint()` —— 即便服务器是明文 HTTP，
+  该方法仍试图用一个 SSL ctx 发 HTTPS 探测包，永远拿不到证书，返回 None，
+  触发报错弹窗。
+
+### 改动概述
+1. **`RemoteClient.get_current_fingerprint()`（`remote_client.py`）**：当
+   `self.is_http == True` 时**直接返回 `None`**，不发任何网络探测。HTTP 协议
+   没有证书 —— 没有「指纹」概念。
+2. **`SettingsWindow.test_remote`（`ucopy.py`）**：HTTP 明文模式下直接跳过
+   整段 cert 探测与「信任此服务器？」弹窗，走 `login_with_key` + `me()` 流程。
+   HTTP 路径写回 cfg 时 `trusted_fingerprint = ""`（与默认一致）。
+3. **`RemoteClient.upload_file`（`remote_client.py`）**：原本无论 scheme 都
+   走 `http.client.HTTPSConnection`。HTTP 路径会触发 TLS handshake 失败。
+   改为按 `self.is_http` 分支：HTTP → `http.client.HTTPConnection`
+   （端口默认 80、无 SSL ctx、跳过 `_pin_after_connect`）；HTTPS → 原路径。
+4. **`.selftest.py`**：新增 v1.7.2 测试 8 条 —— `get_current_fingerprint` 对 HTTP
+   返回 None、`test_remote` 走 `if not is_http_url:` 条件分支、`upload_file` 导入
+   `HTTPConnection` 且按 scheme 选默认端口。
+
+### 不动的边界
+- v1.7.1 已加的 HTTP 明文警告弹窗保留 —— 测试连接 / 启用前仍弹一次。
+- HTTPS 路径不变：自签 cert trust flow + fingerprint pin 逻辑全部保留。
+- `TrustedServerStore` 不清空 —— 已存的旧 HTTPS 指纹保留；HTTP 模式下不读也不写。
+
+### 关键 commit hash
+- `97aa5d7` — fix(remote): HTTP 明文模式跳过证书/指纹探测（test_remote + upload_file）
+
 ## v1.7.1 — 自适应 UI + HTTP 明文模式警告 + 多客户端识别
 
 ### 改动概述

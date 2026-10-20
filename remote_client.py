@@ -546,14 +546,19 @@ class RemoteClient:
         在 BaseHTTPRequestHandler (Connection: close) 模式下挂住，实测 30s+。
         一次性构造是更稳的方案 —— 我们的上传低频（一次复制几十个文件），
         单文件 body 通常 <100MB，单文件全内存完全可接受。
+
+        v1.7.2：按 scheme 分支 —— HTTP 明文模式走 http.client.HTTPConnection，
+        不做 TLS、不读证书；HTTPS 走原 HTTPSConnection + fingerpin 路径。
         """
-        from http.client import HTTPSConnection
+        from http.client import HTTPConnection, HTTPSConnection
 
         boundary = "----UCopyBoundary" + os.urandom(8).hex()
         qs = urllib.parse.urlencode({"path": rel_path})
         url_parts = urllib.parse.urlsplit(self.server_url)
         host = url_parts.hostname
-        port = url_parts.port or 443
+        # v1.7.2：按 scheme 选默认端口 —— HTTP 默认 80；HTTPS 默认 443。
+        default_port = 80 if self.is_http else 443
+        port = url_parts.port or default_port
 
         def field(name: str, value: str) -> bytes:
             return (
@@ -603,24 +608,31 @@ class RemoteClient:
         if cookie_header:
             headers["Cookie"] = cookie_header
 
-        # SSL context
-        if self.store.get_fingerprint(self.server_url):
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+        # v1.7.2：按 scheme 决定底层连接 + SSL 配置。
+        # HTTP 明文：HTTPConnection，不需要 ctx、不读证书。
+        # HTTPS：原路径 —— fingerprint 已存则 CERT_NONE（自签），未存则 CERT_REQUIRED（标准 CA 校验）。
+        if self.is_http:
+            raw_conn = HTTPConnection(host, port, timeout=600)
         else:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = True
-            ctx.verify_mode = ssl.CERT_REQUIRED
+            if self.store.get_fingerprint(self.server_url):
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            else:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = True
+                ctx.verify_mode = ssl.CERT_REQUIRED
+            raw_conn = HTTPSConnection(host, port, context=ctx, timeout=600)
 
         url_path = f"/api/v1/files/upload?{qs}"
         try:
-            raw_conn = HTTPSConnection(host, port, context=ctx, timeout=600)
             try:
                 raw_conn.request("POST", url_path, body=body, headers=headers)
                 resp = raw_conn.getresponse()
                 payload = resp.read(64 * 1024 + 1)
-                self._pin_after_connect(raw_conn)
+                # v1.7.2：HTTP 不读证书，pin 校验跳过。
+                if not self.is_http:
+                    self._pin_after_connect(raw_conn)
                 if 200 <= resp.status < 300:
                     try:
                         return json.loads(payload.decode("utf-8"))
@@ -687,7 +699,14 @@ class RemoteClient:
 
     # ---------- cert pinning helpers ----------
     def get_current_fingerprint(self) -> Optional[str]:
-        """连一次服务器拿当前证书指纹（用新 ctx，不做 pin 校验）。"""
+        """连一次服务器拿当前证书指纹（用新 ctx，不做 pin 校验）。
+
+        v1.7.2：HTTP 明文协议没有证书，返回 None（不再尝试 TLS 探测）。
+        UI 层看到 None → 直接走 login，不再弹指纹/信任对话框。
+        """
+        if self.is_http:
+            # HTTP 协议明文传输，没有证书/指纹可拿。
+            return None
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
