@@ -31,7 +31,18 @@
 - `TrustedServerStore` 不清空 —— 已存的旧 HTTPS 指纹保留；HTTP 模式下不读也不写。
 
 ### 关键 commit hash
-- `97aa5d7` — fix(remote): HTTP 明文模式跳过证书/指纹探测（test_remote + upload_file）
+- `dfa240f` — fix(remote): HTTP 明文模式跳过证书/指纹探测（test_remote + upload_file）
+
+### 待办（用户 2026-10-20 反馈，未做改动，仅记录）
+- **多 token / 多客户端文件区分**：当前 `file_index` 不存 `source_client_id` /
+  `key_id`，`storage` 路径只到 `<data_dir>/files/<username>/<rel_path>`。
+  后果：同一 U 盘在两台客户端上传 → `rel_path` 撞 → 后上传覆盖前者；
+  list API 返回 `name / type / size / mtime / sha256`，无上传来源元数据；
+  多 token 用户之间互相看不到对方上传记录。
+- **config 多版本**：v1.5.0 设计就没存历史版本，`put_user_config` 只覆写
+  `config_json` + `version`（单调递增但不 serve）+ `last_modified`，无法回溯。
+  这两项今天暂不动，等用户提优先级时再议。
+- **U 盘坏文件弹窗**：用户测 10 个 U 盘只 1 个复现，影响小，决定先观察不修。
 
 ## v1.7.1 — 自适应 UI + HTTP 明文模式警告 + 多客户端识别
 
