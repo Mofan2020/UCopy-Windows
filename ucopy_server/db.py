@@ -120,7 +120,18 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(username);
 
 
 def open_db(path: str) -> sqlite3.Connection:
-    """打开 SQLite 连接 + 应用 schema。"""
+    """打开 SQLite 连接 + 应用 schema。
+
+    v1.7.3 增强：事故复盘发现某些 long-running server 实例中
+    server 进程 db handle 与磁盘 db 文件脱钩（POST 200 + db 表里 0 行），
+    重启后写入恢复。根因未确诊（怀疑 macOS launchd + 长 fd 持有）。
+    本次只在打开时做一次自检（cursor 落盘 → 立即 SELECT 对比），
+    不引入额外 PRAGMA，避免误报。
+
+    注：autocommit 模式 (isolation_level=None) 下 commit 由 sqlite3 driver
+    自动完成；不需要显式 conn.commit()。fsync 由 SQLite PRAGMA synchronous
+    控制（默认 NORMAL）。
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row

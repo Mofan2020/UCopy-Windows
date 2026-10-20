@@ -32,7 +32,9 @@ import re
 import secrets
 import shutil
 import signal
+import socketserver
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -1396,7 +1398,84 @@ def run():
     LOG.info(f"Web GUI:   {scheme}://localhost:{cfg['port']}/"
              f"（双栈 → 也能用 {scheme}://127.0.0.1:{cfg['port']}/）")
 
+    # v1.7.3: db handle watchdog —— 每 30s 用一个独立 RO 连接测试一次写入可见性。
+    # 事故复盘发现某些 long-running server 实例中 server 进程的 db handle 跟磁盘
+    # 实际 db 文件脱钩（POST 200 返回，db 表里 0 行），重启后写入恢复。
+    # 根因未确诊；此 watchdog 是"事故快速检测器"+ 事故时优雅 shutdown 让
+    # launchd 自动重启 daemon。
+    # 注意：实际注册在 _shutdown 定义之后，避免 forward reference 问题。
+    _db_watchdog_state = {"stop_event": None, "extras": []}
+    def _start_db_watchdog():
+        db_path = os.path.join(cfg["data_dir"], "server.db")
+        import threading
+        stop_event = threading.Event()
+        def loop():
+            fail_streak = 0
+            # 独立的 RW 连接做"测试写入"（不重用 DB_CONN，避免污染请求链路）
+            try:
+                test_conn = sqlite3.connect(
+                    db_path, check_same_thread=False, isolation_level=None, timeout=5.0
+                )
+            except Exception as e:
+                LOG.warning(f"[watchdog] 启动测试连接失败: {e}")
+                return
+            while not stop_event.is_set():
+                stop_event.wait(30.0)
+                if stop_event.is_set():
+                    test_conn.close()
+                    return
+                marker = f"__ucopy_watchdog_{os.getpid()}_{int(time.time())}"
+                try:
+                    # 写 marker 到临时表（更干净，不污染 user_configs）：
+                    test_conn.execute(
+                        "CREATE TABLE IF NOT EXISTS __ucopy_watchdog ("
+                        "  ts TEXT PRIMARY KEY"
+                        ")"
+                    )
+                    test_conn.execute(
+                        "INSERT INTO __ucopy_watchdog(ts) VALUES (?)", (marker,)
+                    )
+                    ro_conn = sqlite3.connect(
+                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+                    )
+                    rows = ro_conn.execute(
+                        "SELECT ts FROM __ucopy_watchdog WHERE ts = ?", (marker,)
+                    ).fetchall()
+                    ro_conn.close()
+                    test_conn.execute("DELETE FROM __ucopy_watchdog WHERE ts = ?", (marker,))
+                    if not rows:
+                        fail_streak += 1
+                        LOG.warning(f"[watchdog] db handle diverged from disk "
+                                    f"(streak={fail_streak}): RO 看不到刚才 RW 写的 marker={marker}")
+                        if fail_streak >= 3:
+                            LOG.error("[watchdog] 三次连续失败，触发优雅 shutdown 让 launchd 重启")
+                            try:
+                                os.kill(os.getpid(), signal.SIGTERM)
+                            except Exception:
+                                sys.exit(1)
+                            return
+                    else:
+                        if fail_streak > 0:
+                            LOG.info(f"[watchdog] db handle 已恢复 (was streak={fail_streak})")
+                        fail_streak = 0
+                except Exception as e:
+                    LOG.warning(f"[watchdog] 例外: {type(e).__name__}: {e}")
+                    fail_streak += 1
+        t = threading.Thread(target=loop, name="ucopy-db-watchdog", daemon=True)
+        t.start()
+        def _stop_watchdog(*_):
+            stop_event.set()
+        _db_watchdog_state["stop_event"] = stop_event
+        # 与 _shutdown 共存：先套一层，外层负责停 watchdog
+        # 但 _shutdown 现在还没定义（line 1477 之后才定义）。这里用延迟绑定。
+        _db_watchdog_state["extras"].append(stop_event)
+        return _stop_watchdog
+    stop_watchdog = _start_db_watchdog()
+
     def _shutdown(*_):
+        # 先停 watchdog，让它把 thread 退出再 serve_forever shutdown
+        if _db_watchdog_state.get("stop_event") is not None:
+            _db_watchdog_state["stop_event"].set()
         LOG.info("收到退出信号，正在关闭...")
         ThreadingHTTPServer.shutdown(httpd)
         sys.exit(0)

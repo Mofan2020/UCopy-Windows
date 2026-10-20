@@ -1,5 +1,62 @@
 # UCopy 开发笔记
 
+## v1.7.3 — server 端 db handle watchdog（防御性 fix）
+
+### 症状
+- 2026-10-20 用户报告：服务器长时间跑后，「创建 token」返回 200，
+  GET /api/v1/keys 也能看到，但 **SQLite 数据库里没有这条记录**。
+  重启 server 后写入恢复正常。
+
+### 排查关键观察
+- GET /api/v1/keys（server 内存）= 6 条
+- 直接 `sqlite3 server.db "SELECT * FROM api_keys"` = 0 条
+- 服务器进程的 fd 显示打开了 db + WAL（lsof 看到 61440 + 148352 字节）
+- 但 OS 层 ls -la 看 server.db-wal = 0 字节
+- server.db mtime 永不更新（最后一次写入是 10-17 19:42，10-20 启动后没改过）
+- `kill -9` 后进程退出 → db 还是 0 行（说明 server 进程的写入从未刷到磁盘）
+
+### 根因（未确诊）
+**最可能假设**：某些 long-running server 进程中，server 进程的 db handle / WAL fd
+跟磁盘 db 文件脱钩（macOS 上 detach + 长 fd 持有场景，或 launchd + 同时存在多个
+server instance，例如旧 daemon 与新 detach server 并存）。
+
+无法 100% 复现；只能在生产环境 kill -9 重启后观察到"恢复"。
+
+### 改动概述
+1. **`server.py::run()` 内启动 db handle watchdog 线程（v1.7.3）**：
+   - 启动后 30s 一次，用独立 RW sqlite3 连接 + 独立 RO 进程测试
+     "server 写的 marker → 其他进程能不能立刻读到"。
+   - 用临时表 `__ucopy_watchdog (ts TEXT PRIMARY KEY)` 存 marker，
+     INSERT → 独立 RO 连接 SELECT → DELETE，全过程 ≈1ms 完成。
+   - 连续 3 次失败（每次相隔 30s）→ 发 SIGTERM 给当前进程，
+     ThreadingHTTPServer.shutdown()，让 launchd 能自动重启恢复。
+   - 该线程以 daemon=True 启动，SIGTERM/SIGINT 时 stop_event.set() 立即终止。
+2. **`db.py::open_db()` 注释更新**：移除 v1.7.2 PRAGMA busy_timeout 实验性改动
+   （未验证有效），保留写盘路径的注释。
+3. **PyInstaller binary 重新打包** `dist/UCopy-Server-macos-arm64`。
+
+### 不动的边界
+- launchd plist 不改（用户旧 launchd 服务仍是 v1.7.0 binary 路径；新 binary
+  要走 launchd 时需 `launchctl unload && launchctl load`，用户决定时机）。
+- `db.py::open_db()` 保持原 PRAGMA 设置不变（不开 synchronous=FULL，
+  不引 busy_timeout —— 这些都是猜测性 fix，不在确诊范围）。
+
+### 验证
+- 隔离环境 (`_isolated_wd/`) 起新 binary：
+  - GET /ping 200
+  - POST /api/v1/keys → 200，server memory 写入
+  - 独立 sqlite3 RO 读 api_keys → 6 行（一致）
+  - 35s 后 `__ucopy_watchdog` 表存在（说明 watchdog CREATE TABLE 至少跑过一次）
+- 生产 server (pid 79612) 起 v1.7.3 binary，POST /keys 写入正常。
+
+### 已知风险
+- watchdog 是"事故早期检测器"：定位下次事故，不是确诊级 fix。
+- 如果根因是 launchd + detach 并存，仅重启 server 不够 —— 还会复发。
+  长期 fix 是统一所有进程的启动方式，但本研究不触及。
+
+### 关键 commit hash
+- `aaae8ea` — feat(server v1.7.3): db handle watchdog +事故复盘文档
+
 ## v1.7.2 — 远程模式 HTTP 协议适配（fingerprint 探测跳过）
 
 ### 症状
