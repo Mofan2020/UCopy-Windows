@@ -122,21 +122,54 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(username);
 def open_db(path: str) -> sqlite3.Connection:
     """打开 SQLite 连接 + 应用 schema。
 
-    v1.7.3 增强：事故复盘发现某些 long-running server 实例中
-    server 进程 db handle 与磁盘 db 文件脱钩（POST 200 + db 表里 0 行），
-    重启后写入恢复。根因未确诊（怀疑 macOS launchd + 长 fd 持有）。
-    本次只在打开时做一次自检（cursor 落盘 → 立即 SELECT 对比），
-    不引入额外 PRAGMA，避免误报。
+    v1.7.5 修复：关闭 WAL，改用 journal_mode=TRUNCATE。
+
+    背景：v1.7.3 加 watchdog 时观察到 long-running server 里 server 进程的
+    db handle 与磁盘 db 脱钩（API 返回 200 但 db 表 0 行），并抛
+    `sqlite3.OperationalError: disk I/O error`。lsof 显示进程持有多个指向
+    不同 inode 的 server.db-wal，其中若干已 unlinked 但 fd 未释放。
+    复现实验排除了 PyInstaller 作为唯一诱因（源码直跑 60-120s 后同样复现），
+    故障路径始终指向 WAL 文件的 unlink + inode 重建。
+
+    因此不再使用 WAL：TRUNCATE 模式每次事务结束把 journal 截断复用，
+    不产生独立的 -wal/-shm 文件，也就没有 WAL inode 被替换的问题。
+    代价是读写不能完全并发；UCopy Server 是单用户低频写入，代价可忽略。
 
     注：autocommit 模式 (isolation_level=None) 下 commit 由 sqlite3 driver
-    自动完成；不需要显式 conn.commit()。fsync 由 SQLite PRAGMA synchronous
-    控制（默认 NORMAL）。
+    自动完成；不需要显式 conn.commit()。synchronous=FULL 确保每次提交都
+    fsync 到磁盘，避免进程被 kill 时丢已确认的写入。
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    # 切 journal_mode 需要拿库级排它锁；有别的连接开着就会 SQLITE_BUSY。
+    # busy_timeout 只管数据锁，所以这里显式重试几次再放弃。
+    deadline = time.time() + 10.0
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode = TRUNCATE")
+            break
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e) and "busy" not in str(e).lower():
+                raise
+            if time.time() >= deadline:
+                conn.close()
+                raise
+            time.sleep(0.2)
+    conn.execute("PRAGMA synchronous = FULL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    # 从旧版 WAL 模式迁移过来时，磁盘上可能残留 -wal / -shm。
+    # 切到 TRUNCATE 后 SQLite 自己不会再写这两个文件，但历史残留必须删掉，
+    # 否则一个陈旧 WAL 会被当作有效数据重新合并回主库，重复已提交的行。
+    # 顺序：先切模式（SQLite 会把 WAL 内容 checkpoint 进主库），再删残留。
+    for suffix in ("-wal", "-shm"):
+        stale = path + suffix
+        if os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass  # 文件被占用时留给下次启动再清
     conn.executescript(SCHEMA)
     return conn
 

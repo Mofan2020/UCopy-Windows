@@ -1398,12 +1398,18 @@ def run():
     LOG.info(f"Web GUI:   {scheme}://localhost:{cfg['port']}/"
              f"（双栈 → 也能用 {scheme}://127.0.0.1:{cfg['port']}/）")
 
-    # v1.7.3: db handle watchdog —— 每 30s 用一个独立 RO 连接测试一次写入可见性。
-    # 事故复盘发现某些 long-running server 实例中 server 进程的 db handle 跟磁盘
-    # 实际 db 文件脱钩（POST 200 返回，db 表里 0 行），重启后写入恢复。
-    # 根因未确诊；此 watchdog 是"事故快速检测器"+ 事故时优雅 shutdown 让
-    # launchd 自动重启 daemon。
-    # 注意：实际注册在 _shutdown 定义之后，避免 forward reference 问题。
+    # v1.7.5: db handle watchdog —— 每 30s 用一个独立连接测试一次写入可见性。
+    #
+    # 背景：某些 long-running server 实例里 server 进程的 db handle 跟磁盘
+    # db 脱钩（API 返回 200，db 表里 0 行），并抛
+    # `sqlite3.OperationalError: disk I/O error`。根因未确诊（v1.7.5 已改用
+    # journal_mode=TRUNCATE 绕开 WAL inode 问题，但保留 watchdog 作为兜底）。
+    #
+    # v1.7.5 改动：不再用 SIGTERM。之前 SIGTERM 会走 _shutdown() →
+    # ThreadingHTTPServer.shutdown()，而 shutdown() 会阻塞等 serve_forever
+    # 循环退出；如果此时主线程正是 serve_forever 且 db handle 已坏，进程
+    # 实际不退出，fd 不释放，故障持续。改用 SIGKILL：进程立即消失，内核
+    # 回收所有 fd，靠 launchd KeepAlive / 外部 supervisor 拉起新实例。
     _db_watchdog_state = {"stop_event": None, "extras": []}
     def _start_db_watchdog():
         db_path = os.path.join(cfg["data_dir"], "server.db")
@@ -1426,7 +1432,6 @@ def run():
                     return
                 marker = f"__ucopy_watchdog_{os.getpid()}_{int(time.time())}"
                 try:
-                    # 写 marker 到临时表（更干净，不污染 user_configs）：
                     test_conn.execute(
                         "CREATE TABLE IF NOT EXISTS __ucopy_watchdog ("
                         "  ts TEXT PRIMARY KEY"
@@ -1438,21 +1443,22 @@ def run():
                     ro_conn = sqlite3.connect(
                         f"file:{db_path}?mode=ro", uri=True, timeout=2.0
                     )
-                    rows = ro_conn.execute(
-                        "SELECT ts FROM __ucopy_watchdog WHERE ts = ?", (marker,)
-                    ).fetchall()
-                    ro_conn.close()
+                    try:
+                        rows = ro_conn.execute(
+                            "SELECT ts FROM __ucopy_watchdog WHERE ts = ?", (marker,)
+                        ).fetchall()
+                    finally:
+                        ro_conn.close()
                     test_conn.execute("DELETE FROM __ucopy_watchdog WHERE ts = ?", (marker,))
                     if not rows:
                         fail_streak += 1
                         LOG.warning(f"[watchdog] db handle diverged from disk "
                                     f"(streak={fail_streak}): RO 看不到刚才 RW 写的 marker={marker}")
                         if fail_streak >= 3:
-                            LOG.error("[watchdog] 三次连续失败，触发优雅 shutdown 让 launchd 重启")
-                            try:
-                                os.kill(os.getpid(), signal.SIGTERM)
-                            except Exception:
-                                sys.exit(1)
+                            LOG.error("[watchdog] 三次连续失败，SIGKILL 自杀让 supervisor 重启")
+                            # 不做优雅关闭：_shutdown 可能卡在 serve_forever，
+                            # 进程留着就会继续占着已损坏的 db fd。
+                            os.kill(os.getpid(), signal.SIGKILL)
                             return
                     else:
                         if fail_streak > 0:
@@ -1461,13 +1467,20 @@ def run():
                 except Exception as e:
                     LOG.warning(f"[watchdog] 例外: {type(e).__name__}: {e}")
                     fail_streak += 1
+                    if fail_streak >= 3:
+                        LOG.error("[watchdog] 三次连续异常，SIGKILL 自杀让 supervisor 重启")
+                        try:
+                            os.kill(os.getpid(), signal.SIGKILL)
+                        except Exception:
+                            pass
+                        return
         t = threading.Thread(target=loop, name="ucopy-db-watchdog", daemon=True)
         t.start()
         def _stop_watchdog(*_):
             stop_event.set()
         _db_watchdog_state["stop_event"] = stop_event
         # 与 _shutdown 共存：先套一层，外层负责停 watchdog
-        # 但 _shutdown 现在还没定义（line 1477 之后才定义）。这里用延迟绑定。
+        # 但 _shutdown 现在还没定义（下方才定义）。这里用延迟绑定。
         _db_watchdog_state["extras"].append(stop_event)
         return _stop_watchdog
     stop_watchdog = _start_db_watchdog()

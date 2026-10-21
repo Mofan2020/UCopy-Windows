@@ -1,5 +1,74 @@
 # UCopy 开发笔记
 
+## v1.7.5 — 关掉 WAL + watchdog 改 SIGKILL
+
+### 根因线索（仍未到 sqlite3 源码级确诊）
+
+long-running server 里 server 进程的 db handle 与磁盘 db 脱钩：API 返回
+200 但 db 表里 0 行，并抛 `sqlite3.OperationalError: disk I/O error`。
+
+两个稳定的观测点：
+1. `lsof` 显示进程持有多个指向**不同 inode** 的 `server.db-wal`，其中若干
+   已 unlinked 但 fd 未释放。
+2. `diskutil verifyVolume /` 通过，`PRAGMA integrity_check` 返回 ok ——
+   主库文件本身没坏，坏的是 WAL 与主库之间的同步关系。
+
+复现实验排除了 PyInstaller：源码直跑启动后 60–120s 同样复现。所以这不是
+打包产物的问题，是 SQLite 在 macOS 上长 fd 持有场景下的行为。
+
+### 修复
+
+**A. 关闭 WAL**
+
+`open_db()` 从 `journal_mode=WAL` 改为 `journal_mode=TRUNCATE`，并加
+`synchronous=FULL` + `busy_timeout=5000`。
+
+理由：整条故障路径都指向 WAL 文件的 unlink + inode 重建。TRUNCATE 模式
+每次事务结束把 journal 截断复用，不产生独立的 `-wal` / `-shm` 文件，也就
+没有 WAL inode 被替换的问题。代价是读写不能完全并发；UCopy Server 是
+单用户低频写入，代价可忽略。
+
+`synchronous=FULL` 让每次提交都 fsync，避免进程被 kill 时丢掉已返回成功的
+写入 —— 这一点在原 WAL + NORMAL 配置下是做不到的。
+
+另外补了三处健壮性：
+
+- 启动时删掉历史残留的 `-wal` / `-shm`。切到 TRUNCATE 后 SQLite 自己不再
+  写这两个文件，但旧文件留在盘上会被当成有效数据合并回主库。
+- 切 `journal_mode` 需要库级排它锁，`busy_timeout` 只管数据锁，所以显式
+  重试最多 10s 再放弃（Web GUI 或残留进程同时开着 db 时会撞到）。
+- `busy_timeout` 提升到 5s。
+
+**B. watchdog 改 SIGKILL**
+
+v1.7.3 的 watchdog 检测到三次连续失败后发 SIGTERM，走
+`_shutdown()` → `ThreadingHTTPServer.shutdown()`。而 `shutdown()` 会阻塞等
+`serve_forever` 循环退出；主线程此时就在 `serve_forever` 里，进程实际不
+退出，fd 不释放，故障持续。
+
+改用 `SIGKILL`：进程立即消失，内核回收所有 fd，靠 launchd `KeepAlive` 或
+外部 supervisor 拉起新实例。同时把原先只累加 `fail_streak` 不动手的异常
+分支也接上 SIGKILL —— 抛 `OperationalError` 和"RO 读不到 marker"是同一类
+故障，不该区别对待。
+
+watchdog 本身保留：它不修根因，但能在故障时快速止损，且现在真的会自杀。
+
+### 验证
+
+- `.selftest.py` 新增 13 项断言，含真实 sqlite3 行为验证（不是字符串匹配）：
+  跑一次 `open_db()` 确认磁盘上不产生 `-wal` / `-shm`、写入立即被独立连接
+  读到；再造一个 WAL 模式的 db 迁移到 TRUNCATE，确认 5 行数据不丢不重复、
+  残留文件被清掉。
+- 15 分钟压力测试：每 2 秒经 API 写一条 token + 一次配置写入，每次都立刻
+  用独立 `sqlite3` 进程确认磁盘可见。0 次失败。
+- 对照：同样时长下旧 WAL 版本在 60–120s 内就开始丢写。
+
+### 已知未修
+
+- sqlite3 在 macOS 长 fd 持有下的行为本身没查到底。若 TRUNCATE 也扛不住，
+  下一步是换存储（Postgres / Turso），不是继续调 PRAGMA。
+- 生产数据目录里现有 17 个测试 token 是调试残留，需要清掉。
+
 ## v1.7.4 — 现状记录 + 临时恢复工具（不声称修复）
 
 ### 事实（2026-10-20 22:30 ~ 23:50 复盘）
@@ -53,7 +122,8 @@ SIGTERM 后 ThreadingHTTPServer.shutdown() 在主线程阻塞，daemon 线程不
   临时恢复
 
 ### 关键 commit hash
-- `1f8633a` — docs+tool(v1.7.4): restart-server.sh 自动检测+重启 + 复盘诚实声明
+- commit 3d88185 已 force-push amended; GitHub 上 main 的 hash 是 3d88185.
+  notes.md 之前写的 1f8633a 是同 commit 的较早 hash (amend 改了 SHA).
 
 ## v1.7.3 — server 端 db handle watchdog（**未修问题，仅早期检测器**）
 
