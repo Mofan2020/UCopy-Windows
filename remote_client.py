@@ -52,6 +52,13 @@ import urllib.request
 from typing import Callable, Optional
 
 PROTOCOL_VERSION = 1
+
+# urllib 默认发 `User-Agent: Python-urllib/x.y`，Cloudflare 的 WAF / Bot
+# 规则会把这种脚本 UA 判成自动化工具直接拦掉，返回 1010（"the owner of
+# this website has banned your browser's signature"），请求根本到不了
+# 服务器。本地直连不受影响，所以只有走隧道/公网时才暴露。
+# 统一用一个可识别的 UA 头，请求本身仍是普通 HTTP，不做任何伪装以外的事。
+USER_AGENT = "UCopy/1.7.5 (+https://github.com/Mofan2020/UCopy-Windows)"
 TRUSTED_FILE = os.path.join(os.path.expanduser("~"), ".ucopy_trusted_servers.json")
 
 # 剥除的字段（递归剥 security 整个子树）
@@ -364,7 +371,8 @@ class RemoteClient:
     def _request(self, method: str, path: str, *, body=None,
                  content_type=None, parse_json=True):
         url = self.server_url + path
-        headers = {"X-UCopy-Protocol": str(PROTOCOL_VERSION)}
+        headers = {"X-UCopy-Protocol": str(PROTOCOL_VERSION),
+                   "User-Agent": USER_AGENT}
         data = None
         if body is not None:
             if content_type is None and not isinstance(body, (bytes, bytearray)):
@@ -501,7 +509,10 @@ class RemoteClient:
                       progress: Optional[Callable[[int, int], None]] = None) -> bool:
         qs = urllib.parse.urlencode({"path": rel_path})
         url = self.server_url + f"/api/v1/files/download?{qs}"
-        req = urllib.request.Request(url, headers={"X-UCopy-Protocol": str(PROTOCOL_VERSION)})
+        req = urllib.request.Request(url, headers={
+            "X-UCopy-Protocol": str(PROTOCOL_VERSION),
+            "User-Agent": USER_AGENT,
+        })
         if self._opener is None:
             self._opener = self._build_opener()
         try:
@@ -602,6 +613,7 @@ class RemoteClient:
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Content-Length": str(total_size),
             "X-UCopy-Protocol": str(PROTOCOL_VERSION),
+            "User-Agent": USER_AGENT,
             "Connection": "close",
             "Host": f"{host}:{port}",
         }
@@ -711,7 +723,10 @@ class RemoteClient:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         url = self.server_url + "/api/v1/ping"
-        req = urllib.request.Request(url, headers={"X-UCopy-Protocol": str(PROTOCOL_VERSION)})
+        req = urllib.request.Request(url, headers={
+            "X-UCopy-Protocol": str(PROTOCOL_VERSION),
+            "User-Agent": USER_AGENT,
+        })
         try:
             with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
                 # peer cert from socket
