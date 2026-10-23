@@ -842,12 +842,26 @@ class RemoteUploader:
             self._hb_thread = None
 
     def _heartbeat_loop(self):
-        """每 40s 发一次心跳；失败等 5s 重试；410 停止重试并标记 lock_lost。"""
+        """每 40s 发一次心跳；失败等 5s 重试；410 停止重试并标记 lock_lost。
+
+        v1.7.7：client 为空时先自行登录一次。原实现只在上传任务里登录，
+        开启远程模式但尚未复制文件时 client 始终为 None，心跳不会发出，
+        服务器上的独占锁无人持有。
+        """
         while not self._hb_stop.is_set():
             if not self.enabled:
                 self._hb_stop.wait(timeout=5.0)
                 continue
             client = self.client
+            if client is None:
+                # 还没登录 —— 先登录一次（失败就等下一轮重试）
+                try:
+                    self._login()
+                    client = self.client
+                except Exception as e:
+                    self.last_error = f"心跳登录失败: {e}"
+                    self._hb_stop.wait(timeout=5.0)
+                    continue
             if client is None or not self.api_key:
                 # 还没登录，等登录先
                 self._hb_stop.wait(timeout=5.0)
@@ -2275,11 +2289,17 @@ class SettingsWindow:
         # 启用 + 自动上传
         self.remote_enabled_var = tk.BooleanVar(value=bool(cfg_remote.get("enabled", False)))
         self.remote_auto_var = tk.BooleanVar(value=bool(cfg_remote.get("auto_upload", True)))
+        # v1.7.7：这两个 checkbox 必须有 command 回调。只绑 variable 的话，
+        # 勾选动作不执行任何代码，_persist_remote 无人调用，
+        # RemoteUploader.enabled 恒为 False，enqueue 首行直接 return，
+        # 文件不会上传。
         ttk.Checkbutton(parent, text="启用远程模式",
-                        variable=self.remote_enabled_var).grid(
+                        variable=self.remote_enabled_var,
+                        command=self._on_remote_enable_toggle).grid(
             row=4, column=0, sticky="w", padx=5, pady=2)
         ttk.Checkbutton(parent, text="自动上传已拷贝文件",
-                        variable=self.remote_auto_var).grid(
+                        variable=self.remote_auto_var,
+                        command=self._on_remote_auto_toggle).grid(
             row=4, column=1, sticky="w", padx=5, pady=2)
 
         # 指纹 + 状态
@@ -2340,6 +2360,38 @@ class SettingsWindow:
 
     def _refresh_remote_status(self):
         self.remote_status_var.set(self._status_text())
+
+    def _on_remote_enable_toggle(self):
+        """「启用远程模式」checkbox 的 command 回调（v1.7.7）。
+
+        只绑 variable 的话勾选不执行代码，_persist_remote 无人调用，
+        RemoteUploader.enabled 恒为 False，文件不会上传。
+
+        勾选/取消都要落盘并同步到 uploader。
+        """
+        try:
+            self._persist_remote(self.remote_enabled_var.get())
+        except Exception as e:
+            try:
+                self.app.logger.error(f"[remote] 启用状态切换失败: {e}")
+            except Exception:
+                pass
+
+    def _on_remote_auto_toggle(self):
+        """「自动上传已拷贝文件」checkbox 的 command 回调（v1.7.7）。"""
+        auto = bool(self.remote_auto_var.get())
+        rem = self.app.config.setdefault("remote", {})
+        rem["auto_upload"] = auto
+        try:
+            save_config(self.app.config)
+        except Exception:
+            pass
+        self.app.remote_uploader.auto_upload = auto
+        try:
+            self.app.logger.info(f"[remote] 自动上传已{'开启' if auto else '关闭'}")
+        except Exception:
+            pass
+        self._refresh_remote_status()
 
     def _persist_remote(self, enabled_now: bool):
         """把 UI 的 remote 段写回 cfg + 同步到 RemoteUploader，启用时弹强制确认。
@@ -2406,6 +2458,30 @@ class SettingsWindow:
             # 用户取消
             self.remote_enabled_var.set(False)
             return False
+
+        # v1.7.7：启用前做一次连接校验。
+        # 只写 enabled=True 的话，上传线程登录失败会持续静默重试，
+        # 界面无任何提示。这里先验一次，失败就报错并把 checkbox 复位。
+        if REMOTE_CLIENT_AVAILABLE and remote_client:
+            try:
+                _client = remote_client.RemoteClient(url)
+                if not url.lower().startswith("http://"):
+                    _store = _client.store
+                    if not _store.get_fingerprint(url):
+                        messagebox.showerror(
+                            "尚未信任服务器",
+                            "这台服务器的证书还没信任过。\n\n"
+                            "请先点「测试连接」，在弹出的指纹确认框里确认信任，\n"
+                            "然后再勾选「启用远程模式」。",
+                            parent=self.win)
+                        self.remote_enabled_var.set(False)
+                        return False
+                _client.login_with_key(api_key, client_name)
+            except Exception as e:
+                messagebox.showerror("启用失败", f"无法连接服务器：\n\n{e}",
+                                     parent=self.win)
+                self.remote_enabled_var.set(False)
+                return False
 
         # 写回 + 启动
         self.app.config.setdefault("remote", {})

@@ -1,5 +1,70 @@
 # UCopy 开发笔记
 
+## v1.7.7 — 修复远程模式开关未生效导致无法上传
+
+### 症状
+
+客户端勾选「启用远程模式」后，「测试连接」和「推送配置到服务器」都成功，
+服务器日志里也有 key 登录记录，但 `files/check` / `files/upload` /
+`auth/heartbeat` 一条都没有 —— 文件始终传不上来。
+
+### 根因
+
+设置面板里两个 checkbox 只绑了 `variable`，没绑 `command`：
+
+```python
+ttk.Checkbutton(parent, text="启用远程模式",
+                variable=self.remote_enabled_var).grid(...)
+```
+
+`variable=` 只同步勾选状态与变量值，勾选动作本身不执行代码。负责落盘并
+同步 uploader 的 `_persist_remote()`（`ucopy.py::SettingsWindow`）定义了但
+没有调用点 —— 逐个 commit 查过 git 历史，从 v1.5.0 引入远程模式起就没人调过。
+
+后果链：
+
+1. `RemoteUploader.enabled` 恒为 `False`
+2. `enqueue()` 首行 `if not self.enabled or not self.auto_upload: return` 丢弃全部任务
+3. `_heartbeat_loop()` 里 `if not self.enabled: continue`，心跳一次都不发
+
+连接路径（测试连接、推送配置）各自 new client，与上传队列的开关互不相干，
+所以会出现「连得上但收不到文件」。
+
+### 改动概述
+
+| 改动 | 位置 |
+|---|---|
+| 两个 checkbox 补 `command=` 回调 | `ucopy.py::SettingsWindow._build_remote_frame` |
+| 新增 `_on_remote_enable_toggle` / `_on_remote_auto_toggle` | `ucopy.py::SettingsWindow` |
+| 启用前做一次连接校验，失败报错并复位 checkbox | `ucopy.py::SettingsWindow._persist_remote` |
+| 心跳线程在 client 为空时先自行登录 | `ucopy.py::RemoteUploader._heartbeat_loop` |
+
+启用前的连接校验是防再次静默失败：原先勾上即写 `enabled=True`，上传线程登录
+失败会持续静默重试，界面无任何提示。心跳自行登录解决另一种情况：原先只在
+上传任务里登录，开启远程模式但尚未复制文件时 client 始终为 None，心跳不会
+发出，服务器上独占锁无人持有。
+
+### 测试覆盖
+
+- `.selftest.py` 新增 5 条回归断言（共 321 项全绿）：两个 checkbox 绑了 command、
+  `_persist_remote` 有调用点、启用前做连接校验、心跳自行登录
+- `device_indicator.py --selftest` 48/48 不受影响
+- 真实 HTTP server 跑通完整链路：upload → 服务器列出文件 → sha256 一致 →
+  下载内容字节一致 → 心跳写入独占锁 → 重复上传被 sha 短路
+
+### 不动的边界
+
+- 服务器端（`ucopy_server/`）未改动 —— 数据面协议本身正常，日志里
+  `files/upload 200` / `files/check 404→200` / `files/download 200` 均正常
+- 客户端仍无「浏览/下载服务器文件」的界面入口。`download_file` / `list_dir`
+  只在 `remote_client.py` 提供，服务器 Web GUI 侧已有文件浏览与下载。
+- 客户端 UI 的桌面行为未在 Windows 上实测验证（见下）
+
+### 已知未修
+
+- 客户端 UI 自动化测试需在 Windows 上跑。`save_remote_key` 在非 Windows 平台
+  走系统钥匙串，桌面端测试无法在开发机上执行。
+
 ## v1.7.5 — 关掉 WAL + watchdog 改 SIGKILL
 
 ### 根因线索（仍未到 sqlite3 源码级确诊）
