@@ -58,12 +58,11 @@ ttk.Checkbutton(parent, text="启用远程模式",
   `files/upload 200` / `files/check 404→200` / `files/download 200` 均正常
 - 客户端仍无「浏览/下载服务器文件」的界面入口。`download_file` / `list_dir`
   只在 `remote_client.py` 提供，服务器 Web GUI 侧已有文件浏览与下载。
-- 客户端 UI 的桌面行为未在 Windows 上实测验证（见下）
 
 ### 已知未修
 
-- 客户端 UI 自动化测试需在 Windows 上跑。`save_remote_key` 在非 Windows 平台
-  走系统钥匙串，桌面端测试无法在开发机上执行。
+- 客户端 UI 的桌面行为未在 Windows 上实测验证。`save_remote_key` 在非 Windows
+  平台走系统钥匙串，客户端 UI 自动化测试需在 Windows 上跑。
 
 ## v1.7.5 — 关掉 WAL + watchdog 改 SIGKILL
 

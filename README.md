@@ -202,13 +202,15 @@ UCopy can connect to a remote server, automatically upload the files it copies l
 3. **Open the "Remote Mode" section** in UCopy's settings panel:
    - Server address (e.g. `https://[2609::1]:8443` or `https://example.com:8443`)
    - **API Key** (paste the full key from step 2)
-   - **Client name** (defaults to the hostname; the server shows it as `in use: <name>`)
-   - Tick "Enable Remote Mode" → three mandatory confirmations appear (all must be ticked):
-     1. I will only use this tool for lawful purposes; all liability for misuse rests with me.
-     2. I am not being deceived or induced into enabling this mode.
-     3. I have confirmed the server address is correct and that the server has enough storage for my uploads.
+   - Client name (defaults to the hostname; the server shows it as `in use: <name>`)
+   - Click **"Test Connection"** → a "Trust self-signed certificate" dialog appears (with the cert fingerprint). Confirm it, and the fingerprint is saved to `~/.ucopy_trusted_servers.json` so it is not asked again.
 
-4. **First connection** shows a "Trust self-signed certificate" dialog (with the cert fingerprint). After confirmation, the fingerprint is saved to `~/.ucopy_trusted_servers.json` and not prompted again.
+4. **Tick "Enable Remote Mode"** → three mandatory confirmations appear (all must be ticked):
+   1. I will only use this tool for lawful purposes; all liability for misuse rests with me.
+   2. I am not being deceived or induced into enabling this mode.
+   3. I have confirmed the server address is correct and that the server has enough storage for my uploads.
+
+   UCopy then verifies the connection before enabling. If it cannot reach the server, the checkbox is reset and the error is shown.
 
 5. **After every USB copy**, a background thread uploads the files that pass the `extensions / regex_pattern / max_single_file_mb` filter to the server. SHA-256 dedup avoids retransfers.
 
